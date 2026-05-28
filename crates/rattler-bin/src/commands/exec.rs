@@ -1,23 +1,9 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    env,
-    path::{Path, PathBuf},
-    str::FromStr,
-    sync::Arc,
-};
-
+use std::{collections::{BTreeSet, HashMap}, env, path::{Path, PathBuf}, str::FromStr, sync::Arc,};
 use clap::{Parser, ValueHint};
 use miette::{Context, IntoDiagnostic};
-use rattler::{
-    default_cache_dir,
-    install::{IndicatifReporter, Installer},
-    package_cache::PackageCache,
-};
+use rattler::{default_cache_dir, install::{IndicatifReporter, Installer}, package_cache::PackageCache,};
 use rattler_cache::EXEC_ENVS_DIR;
-use rattler_conda_types::{
-    Channel, ChannelConfig, GenericVirtualPackage, MatchSpec, Matches, PackageName, Platform,
-    ParseMatchSpecOptions,
-};
+use rattler_conda_types::{Channel, ChannelConfig, GenericVirtualPackage, MatchSpec, Matches, PackageName, Platform, ParseMatchSpecOptions,};
 use rattler_networking::AuthenticationMiddleware;
 use rattler_repodata_gateway::{Gateway, RepoData, SourceConfig};
 use rattler_shell::shell::ShellEnum;
@@ -31,7 +17,7 @@ use crate::{
     global_multi_progress,
 };
 
-/// Run a command in a temporary, cached conda environment.
+/// Run a command and install it in a temporary environment.
 #[derive(Debug, Parser)]
 #[clap(trailing_var_arg = true, arg_required_else_help = true)]
 pub struct Opt {
@@ -44,8 +30,8 @@ pub struct Opt {
     #[clap(long = "spec", short = 's', value_name = "SPEC")]
     pub specs: Vec<String>,
 
-    /// Additional packages to install alongside the guessed command package.
-    /// extra packages on top. Conflicts with --spec.
+    /// Matchspecs of package to install, while also guessing a package
+    /// from the command.
     #[clap(long, short = 'w', conflicts_with = "specs")]
     pub with: Vec<String>,
     
@@ -61,7 +47,8 @@ pub struct Opt {
     #[clap(long)]
     pub force_reinstall: bool,
 
-    /// List packages in the environment before executing.
+    /// Before executing the command, list packages in the environment
+    /// Specify `--list=some_regex` to filter the shown packages    
     #[clap(long = "list", num_args = 0..=1, default_missing_value = "", require_equals = true)]
     pub list: Option<String>,
 
@@ -76,7 +63,6 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
     let channel_config =
         ChannelConfig::default_with_root_dir(env::current_dir().into_diagnostic()?);
 
-    // Split command from its arguments
     let mut command_parts = opt.command.iter();
     let command = command_parts.next().ok_or_else(|| {
         miette::miette!(
@@ -94,13 +80,11 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
         .collect::<Result<Vec<_>, _>>()
         .into_diagnostic()?;
 
-    // Parse --spec and --with into MatchSpecs
+    // Determine the specs for installation and for the environment name.
     let explicit_specs = parse_specs(&opt.specs)?;
     let with_specs = parse_specs(&opt.with)?;
 
-    // Guess a package from the command name when:
-    //   - no --spec given at all (plain `rattler exec python`)
-    //   - --with is used (guess command package AND install the extras)
+    // Guess a package from the command if no specs were provided at all OR if --with is used
     let should_guess = opt.specs.is_empty() || !opt.with.is_empty();
 
     let mut install_specs = explicit_specs.clone();
@@ -128,7 +112,7 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
     )
     .await?;
 
-    // Build extra env vars: PIXI_ENVIRONMENT_NAME and optional PS1 prompt
+    // Build extra environment variables
     let mut extra_env: HashMap<String, String> = HashMap::new();
 
     // Collect display names from the named specs (not the guessed one)
@@ -167,7 +151,6 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
         }
     }
 
-    // Reconstruct the full command vector (executable + forwarded args)
     let full_command: Vec<String> = std::iter::once(command.clone())
         .chain(command_parts.cloned())
         .collect();
@@ -181,7 +164,7 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
         &full_command,
         shell,
         &extra_env,
-        None, // cwd: inherit from parent
+        None,
     )
     .await
     .map_err(|e| miette::miette!("failed to execute '{}': {}", command, e))?;
@@ -189,8 +172,7 @@ pub async fn exec(opt: Opt) -> miette::Result<()> {
     std::process::exit(status.code().unwrap_or(1));
 }
 
-/// Finds a cached exec prefix that matches the given specs/channels/platform,
-/// or creates one by solving and installing the packages.
+/// Creates a prefix for the `rattler exec` command.
 async fn create_exec_prefix(
     specs: &[MatchSpec],
     channels: &[Channel],
@@ -214,6 +196,8 @@ async fn create_exec_prefix(
 
     let sentinel = prefix.join(".exec-ready");
 
+    // If the environment already exists, and we are not forcing a
+    // reinstallation, we can return early.
     if sentinel.exists() && !force_reinstall {
         tracing::info!("reusing existing environment in {}", prefix.display());
         return Ok(prefix);
@@ -261,7 +245,7 @@ async fn create_exec_prefix(
     let total_records: usize = repo_data.iter().map(RepoData::len).sum();
     tracing::debug!("loaded {} records from repodata", total_records);
 
-    // ── Virtual packages ──────────────────────────────────────────────────
+    // Determine virtual packages of the current platform
     let virtual_packages: Vec<GenericVirtualPackage> =
         VirtualPackage::detect(&VirtualPackageOverrides::default())
             .into_diagnostic()
@@ -280,6 +264,7 @@ async fn create_exec_prefix(
         .into_diagnostic()
         .context("failed to solve environment")?;
 
+    // Solve the environment
     tracing::info!(
         "installing environment in {}",
         dunce::canonicalize(&prefix)
@@ -310,7 +295,6 @@ async fn create_exec_prefix(
         .into_diagnostic()
         .context("failed to write sentinel file")?;
 
-    // Optionally print a package listing
     if let Some(regex) = list {
         list_environment(specs, &solved.records, regex)?;
     }
@@ -327,8 +311,6 @@ fn parse_specs(raw: &[String]) -> miette::Result<Vec<MatchSpec>> {
         })
         .collect()
 }
-
-// ── Helper: environment hashing ───────────────────────────────────────────────
 
 /// Produces a deterministic hex hash over (sorted specs, sorted channels, platform).
 ///
@@ -348,17 +330,10 @@ fn compute_env_hash(specs: &[MatchSpec], channels: &[String], platform: Platform
     hasher.update("|");
     hasher.update(platform.to_string());
 
-    format!("{:x}", hasher.finalize())
+    hex::encode(hasher.finalize())
 }
 
-// ── Helper: directory prefix naming ──────────────────────────────────────────
-
 /// Returns the human-readable prefix used in the cached env directory name.
-///
-/// Rules (mirrors pixi exec):
-///   - Exactly one spec  → use that spec's package name
-///   - Guessed package   → use the command name
-///   - Multiple explicit → no prefix (hash only)
 fn exec_dir_prefix(
     specs: &[MatchSpec],
     command: Option<&str>,
@@ -395,8 +370,6 @@ fn guess_package_spec(command: &str) -> MatchSpec {
         ..Default::default()
     }
 }
-
-// ── Helper: package listing ───────────────────────────────────────────────────
 
 /// Prints a table of installed packages, with explicitly requested ones marked.
 /// Optionally filtered to packages whose names match `regex`.
@@ -465,42 +438,36 @@ mod tests {
         MatchSpec::from_str(s, ParseStrictness::Lenient).unwrap()
     }
 
-    // `rattler exec --spec ripgrep rg`: single spec → use the spec's package name.
     #[test]
     fn single_explicit_spec_wins() {
         let prefix = exec_dir_prefix(&[spec("ripgrep")], Some("rg"), false);
         assert_eq!(prefix.as_deref(), Some("ripgrep"));
     }
 
-    // `rattler exec rg`: no spec, guessed from command → use command name.
     #[test]
     fn guessed_only_uses_command() {
         let prefix = exec_dir_prefix(&[spec("rg")], Some("rg"), true);
         assert_eq!(prefix.as_deref(), Some("rg"));
     }
 
-    // `rattler exec --with numpy python`: guess python + extra → use command.
     #[test]
     fn with_uses_command_not_extra_spec() {
         let prefix = exec_dir_prefix(&[spec("numpy"), spec("python")], Some("python"), true);
         assert_eq!(prefix.as_deref(), Some("python"));
     }
 
-    // `rattler exec --spec foo --spec bar cmd`: multiple explicit specs → no prefix.
     #[test]
     fn multiple_explicit_specs_have_no_prefix() {
         let prefix = exec_dir_prefix(&[spec("foo"), spec("bar")], Some("cmd"), false);
         assert_eq!(prefix, None);
     }
 
-    // Illegal characters in the command name are replaced with dashes.
     #[test]
     fn guess_sanitizes_illegal_chars() {
         let s = guess_package_spec("my/cmd!");
         assert_eq!(s.name.as_exact().unwrap().as_normalized(), "my-cmd-");
     }
 
-    // The hash is stable: same inputs always produce the same output.
     #[test]
     fn env_hash_is_deterministic() {
         let specs = vec![spec("python=3.12"), spec("numpy")];
@@ -512,7 +479,6 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    // Argument order must not affect the hash.
     #[test]
     fn env_hash_is_order_independent() {
         let channels = vec![
@@ -531,7 +497,6 @@ mod tests {
         assert_eq!(h1, h2);
     }
 
-    // Different platforms must not collide.
     #[test]
     fn env_hash_differs_by_platform() {
         let specs = vec![spec("python=3.12")];
