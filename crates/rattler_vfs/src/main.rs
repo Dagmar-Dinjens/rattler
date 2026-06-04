@@ -1,3 +1,7 @@
+mod metadata;
 fn main() {
-    println!("Hello, world!");
+    // solve env
+    // spin up mount
+    // decide the 
+
 }

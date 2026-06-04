@@ -5543,6 +5543,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "rattler_vfs"
+version = "0.1.0"
+
+[[package]]
 name = "rattler_virtual_packages"
 version = "2.4.1"
 dependencies = [
