@@ -15,8 +15,39 @@ use std::{
 pub mod backends;
 pub mod metadata;
 pub mod mount;
+pub mod prefix_placeholder;
 pub mod prefix_replacement;
 pub mod virtual_fs_core;
+
+pub mod tests;
+
+pub use mount::{MountBackend, MountSession};
+
+pub async fn mount_environment(
+    pixi_lock: PathBuf,
+    cache_origin: PathBuf,
+    mount_dir: PathBuf,
+    backend: MountBackend,
+    environment_name: String,
+) -> anyhow::Result<Box<dyn MountSession>> {
+    let package_refs = solve_environment(&pixi_lock, &environment_name)?;
+
+    let mut metadata = vec![FSMetadata::new_directory(PathBuf::from("."), 0)];
+    let mut directory_indices = HashMap::new();
+    directory_indices.insert(PathBuf::from("."), 0);
+
+    for package_ref in package_refs {
+        let (paths_json, package_dir) = get_paths_json(&package_ref, &cache_origin)?;
+        path_parse(
+            paths_json,
+            package_dir,
+            &mut metadata,
+            &mut directory_indices,
+        );
+    }
+
+    backends::generate_mount(backend, metadata, mount_dir).await
+}
 
 pub fn solve_environment(
     pixi_lock: &Path,
@@ -105,7 +136,7 @@ pub fn path_parse(
                 .clone()
                 .map(|prefix_placeholder: PrefixPlaceholder| {
                     let source_bytes = std::fs::read(&file_path).unwrap_or_default();
-                    crate::metadata::PrefixReplacement::from_placeholder(
+                    crate::metadata::CustomPrefixPlaceholder::from_placeholder(
                         prefix_placeholder,
                         &source_bytes,
                     )

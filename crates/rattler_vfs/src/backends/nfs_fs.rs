@@ -17,6 +17,8 @@ fn to_fattr(attr: VirtualAttr, ino: u64) -> fattr3 {
     fattr3 {
         type_: if attr.is_dir {
             ftype3::NF3DIR
+        } else if attr.is_symlink {
+            ftype3::NF3LNK
         } else {
             ftype3::NF3REG
         },
@@ -40,6 +42,14 @@ fn nfs_error(e: anyhow::Error) -> nfsstat3 {
     nfsstat3::NFS3ERR_IO
 }
 
+fn handle_to_ino(handle: &FileHandleU64) -> Result<usize, nfsstat3> {
+    let raw = handle.as_u64();
+    if raw == 0 {
+        return Err(nfsstat3::NFS3ERR_BADHANDLE);
+    }
+    Ok(raw as usize)
+}
+
 impl NfsReadFileSystem for NfsFS {
     type Handle = FileHandleU64;
 
@@ -52,20 +62,19 @@ impl NfsReadFileSystem for NfsFS {
         dirid: &FileHandleU64,
         filename: &filename3<'_>,
     ) -> Result<FileHandleU64, nfsstat3> {
-        let parent = (dirid.as_u64() - 1) as usize;
+        let parent_ino = handle_to_ino(dirid)?;
         let name = OsStr::from_bytes(filename.as_ref());
-        let child = self
+        let child_idx = self
             .inner
-            .lookup(parent, name)
+            .lookup(parent_ino, name)
             .ok_or(nfsstat3::NFS3ERR_NOENT)?;
 
-        Ok(FileHandleU64::new((child + 1) as u64))
+        Ok(FileHandleU64::new((child_idx + 1) as u64))
     }
 
     async fn getattr(&self, id: &FileHandleU64) -> Result<fattr3, nfsstat3> {
-        let ino = (id.as_u64() - 1) as usize;
+        let ino = handle_to_ino(id)?;
         let attr = self.inner.getattr(ino).map_err(nfs_error)?;
-
         Ok(to_fattr(attr, id.as_u64()))
     }
 
@@ -75,7 +84,7 @@ impl NfsReadFileSystem for NfsFS {
         offset: u64,
         count: u32,
     ) -> Result<(Vec<u8>, bool), nfsstat3> {
-        let ino = (id.as_u64() - 1) as usize;
+        let ino = handle_to_ino(id)?;
         let fh = self.inner.open_cached(ino).map_err(nfs_error)?;
         let data = self
             .inner
@@ -99,7 +108,7 @@ impl NfsReadFileSystem for NfsFS {
         dirid: &FileHandleU64,
         cookie: u64,
     ) -> Result<impl ReadDirPlusIterator, nfsstat3> {
-        let ino = (dirid.as_u64() - 1) as usize;
+        let ino = handle_to_ino(dirid)?;
         let entries = self.inner.readdir(ino).map_err(nfs_error)?;
 
         Ok(NfsDirectoryIterator::new(
@@ -109,8 +118,10 @@ impl NfsReadFileSystem for NfsFS {
         ))
     }
 
-    async fn readlink(&self, _id: &FileHandleU64) -> Result<nfspath3<'_>, nfsstat3> {
-        Err(nfsstat3::NFS3ERR_INVAL)
+    async fn readlink(&self, id: &FileHandleU64) -> Result<nfspath3<'_>, nfsstat3> {
+        let ino = handle_to_ino(id)?;
+        let target: Vec<u8> = self.inner.readlink(ino).map_err(nfs_error)?;
+        Ok(nfspath3::from(target))
     }
 }
 
@@ -137,9 +148,10 @@ impl ReadDirPlusIterator for NfsDirectoryIterator {
         };
         self.index += 1;
 
+        // entry.ino is already a 1-based inode — pass directly to getattr
         let attr = self
             .inner
-            .getattr((entry.ino - 1) as usize)
+            .getattr(entry.ino as usize)
             .ok()
             .map(|attr| to_fattr(attr, entry.ino));
 

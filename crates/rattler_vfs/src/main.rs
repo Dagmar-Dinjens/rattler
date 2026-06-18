@@ -2,14 +2,9 @@ use anyhow::Result;
 use clap::{Arg, Command};
 use compio;
 use rattler_cache::{PACKAGE_CACHE_DIR, default_cache_dir};
-use std::{collections::HashMap, path::PathBuf};
+use std::path::PathBuf;
 
-use rattler_vfs::{
-    backends::generate_mount,
-    metadata::FSMetadata,
-    mount::{MountBackend, MountSession},
-    path_parse, solve_environment,
-};
+use rattler_vfs::{MountBackend, mount_environment};
 
 #[compio::main]
 async fn main() -> Result<()> {
@@ -44,37 +39,6 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-pub async fn mount_environment(
-    pixi_lock: PathBuf,
-    cache_origin: PathBuf,
-    mount_dir: PathBuf,
-    backend: MountBackend,
-    environment_name: String,
-) -> anyhow::Result<Box<dyn MountSession>> {
-    let package_refs = solve_environment(&pixi_lock, &environment_name)?;
-
-    let mut metadata = vec![FSMetadata::new_directory(PathBuf::from("."), 0)];
-
-    let mut directory_indices = HashMap::new();
-    directory_indices.insert(PathBuf::from("."), 0);
-
-    for package_ref in package_refs {
-        let (paths_json, package_dir) = rattler_vfs::get_paths_json(&package_ref, &cache_origin)?;
-
-        // pixi_lock:    _which packages to make available/ check for availability_ empty? can't be empty (can't make an empty env)
-        // cache_origin: _where the packages are cached locally/ read from_         empty? default to regular cache location
-        // mounting_dir: _where the packages optically are for the system_          empty? default to where the package is?
-        // mount_type:   _which type backend (NFS/FUSE/etc.) to use_                empty? default to NFS/ best optimised for system
-        path_parse(
-            paths_json,
-            package_dir,
-            &mut metadata,
-            &mut directory_indices,
-        );
-    }
-
-    generate_mount(backend, metadata, mount_dir).await
-}
 
 pub struct MountArgs {
     pub pixi_lock: PathBuf,
@@ -103,13 +67,13 @@ fn handle_input_arguments() -> anyhow::Result<MountArgs> {
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
-            Arg::new("mount-type")
-                .long("mount-type")
+            Arg::new("MOUNT_TYPE")
+                .long("MOUNT_TYPE")
                 .default_value("nfs"),
         )
         .arg(
-            Arg::new("environment")
-                .long("environment")
+            Arg::new("ENVIRONMENT")
+                .long("ENVIRONMENT")
                 .default_value("default"),
         )
         .get_matches();
@@ -127,17 +91,19 @@ fn handle_input_arguments() -> anyhow::Result<MountArgs> {
 
     let mount_dir = matches
         .get_one::<PathBuf>("MOUNT_DIR")
-        .cloned()
-        .unwrap_or_else(|| std::env::current_dir().unwrap());
+        .unwrap()
+        .to_path_buf();
 
     let mount_type = MountBackend::from(
         matches
-            .get_one::<String>("mount-type")
+            .get_one::<String>("MOUNT_TYPE")
             .map(String::as_str)
             .unwrap_or("nfs"),
     );
 
-    let environment_name = matches.get_one::<String>("environment").unwrap().clone();
+    let environment_name = matches.get_one::<String>("ENVIRONMENT").unwrap().clone();
+
+    let mount_dir = mount_dir.canonicalize().unwrap();
 
     Ok(MountArgs {
         pixi_lock,

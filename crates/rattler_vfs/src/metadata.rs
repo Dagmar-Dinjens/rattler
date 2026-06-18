@@ -1,4 +1,5 @@
 use memchr::memmem;
+use memmap2::Mmap;
 use rattler_conda_types::package::{FileMode, PathType, PrefixPlaceholder};
 use std::{
     ffi::{OsStr, OsString},
@@ -6,23 +7,28 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Debug)]
-pub struct PrefixReplacement {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CustomPrefixPlaceholder {
     pub file_mode: FileMode,
+    /// The build-time prefix path that appears verbatim in the cached file.
     pub placeholder: String,
+    /// Byte offsets where `placeholder` starts in the file.
     pub offsets: Vec<usize>,
 }
 
-impl PrefixReplacement {
-    pub fn from_placeholder(prefix_placeholder: PrefixPlaceholder, source_bytes: &[u8]) -> Self {
-        let offsets =
-            memmem::find_iter(source_bytes, prefix_placeholder.placeholder.as_bytes()).collect();
-
-        Self {
-            file_mode: prefix_placeholder.file_mode,
-            placeholder: prefix_placeholder.placeholder,
+impl CustomPrefixPlaceholder {
+    pub fn from_placeholder(placeholder: PrefixPlaceholder, source_bytes: &[u8]) -> Self {
+        let offsets = memmem::find_iter(source_bytes, placeholder.placeholder.as_bytes()).collect();
+        CustomPrefixPlaceholder {
+            file_mode: placeholder.file_mode,
+            placeholder: placeholder.placeholder,
             offsets,
         }
+    }
+
+    pub fn fill_offsets(&mut self, open_file: &Mmap) {
+        let mut offsets = memmem::find_iter(open_file, self.placeholder.as_bytes()).collect();
+        self.offsets.append(&mut offsets);
     }
 }
 
@@ -48,8 +54,8 @@ pub struct FSFile {
     pub file_name: OsString,
     pub parent: usize,
     pub cache_base_path: Arc<Path>,
-    pub _path_type: PathType,
-    pub prefix_placeholder: Option<PrefixReplacement>,
+    pub path_type: PathType,
+    pub prefix_placeholder: Option<CustomPrefixPlaceholder>,
 }
 
 impl FSFile {
@@ -57,14 +63,14 @@ impl FSFile {
         file_name: OsString,
         parent: usize,
         cache_base_path: Arc<Path>,
-        _path_type: PathType,
-        prefix_placeholder: Option<PrefixReplacement>,
+        path_type: PathType,
+        prefix_placeholder: Option<CustomPrefixPlaceholder>,
     ) -> Self {
         FSFile {
             file_name,
             parent,
             cache_base_path,
-            _path_type,
+            path_type,
             prefix_placeholder,
         }
     }
@@ -86,6 +92,7 @@ impl FSMetadata {
             Self::FSFile(file) => &file.file_name,
         }
     }
+
     pub fn new_directory(prefix_path: PathBuf, parent: usize) -> Self {
         FSMetadata::FSDirectory(FSDirectory::new(prefix_path, parent))
     }
@@ -95,7 +102,7 @@ impl FSMetadata {
         parent: usize,
         cache_base_path: Arc<Path>,
         path_type: PathType,
-        prefix_placeholder: Option<PrefixReplacement>,
+        prefix_placeholder: Option<CustomPrefixPlaceholder>,
     ) -> Self {
         FSMetadata::FSFile(FSFile::new(
             file_name,
@@ -112,12 +119,14 @@ impl FSMetadata {
             Self::FSFile(_) => None,
         }
     }
+
     pub fn as_directory_mut(&mut self) -> Option<&mut FSDirectory> {
         match self {
             Self::FSDirectory(directory) => Some(directory),
             Self::FSFile(_) => None,
         }
     }
+
     pub fn as_file(&self) -> Option<&FSFile> {
         match self {
             Self::FSFile(file) => Some(file),

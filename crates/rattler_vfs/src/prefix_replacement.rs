@@ -1,16 +1,16 @@
 use memchr::memmem;
 use memmap2::Mmap;
-use std::{os::unix::ffi::OsStrExt, path::PathBuf};
+use std::{os::unix::ffi::OsStrExt, path::Path};
 
-use crate::metadata::PrefixReplacement;
+use crate::metadata::CustomPrefixPlaceholder;
 
 pub fn text_prefix_replacement(
-    placeholder: &PrefixReplacement,
+    placeholder: &CustomPrefixPlaceholder,
     start: usize,
     _end: usize,
     size: usize,
     file: &Mmap,
-    mount_point: &PathBuf,
+    mount_point: &Path,
 ) -> Vec<u8> {
     if start >= file.len() {
         return vec![];
@@ -45,22 +45,17 @@ pub fn text_prefix_replacement(
 }
 
 pub fn binary_prefix_replacement(
-    placeholder: &PrefixReplacement,
+    placeholder: &CustomPrefixPlaceholder,
     start: usize,
     end: usize,
     _size: usize,
     file: &Mmap,
-    mount_point: &PathBuf,
+    mount_point: &Path,
 ) -> Vec<u8> {
-    // Maybe check if the end is not later than the end
-    // Using this method will replace/ read byte by byte, it might be better to create a function which handles this more efficiently?
-    //  ? storing nul bytes in another list
-
     let new_prefix = mount_point.as_os_str().as_bytes();
     let length_placeholder = placeholder.placeholder.len();
     let length_prefix = new_prefix.len();
 
-    // Handle underflow: use checked subtraction or i64
     if length_prefix > length_placeholder {
         panic!("New prefix is longer than placeholder");
     }
@@ -79,10 +74,9 @@ pub fn binary_prefix_replacement(
         Err(index) => index,
     };
 
-    // should be actual start
     let mut unfinished_replacements = if next_placeholder_index >= 1 {
         let placeholders_before = &placeholder.offsets[0..next_placeholder_index];
-        find_unfinished_replacements(file[0..start].to_vec(), placeholders_before.to_vec())
+        find_unfinished_replacements(&file[0..start], placeholders_before)
     } else {
         0
     };
@@ -102,11 +96,9 @@ pub fn binary_prefix_replacement(
             end
         };
 
-        // Only process if we've reached a placeholder within our range
         if file_pos == next_placeholder && next_placeholder < end {
             next_placeholder_index += 1;
 
-            // Copy the new prefix
             let copy_len = length_prefix.min(length - buffer_pos);
             buffer[buffer_pos..buffer_pos + copy_len].copy_from_slice(&new_prefix[..copy_len]);
             buffer_pos += copy_len;
@@ -116,21 +108,18 @@ pub fn binary_prefix_replacement(
                 return buffer;
             }
 
-            // Skip the old placeholder in the file
             file_pos += length_placeholder;
 
             if file_pos >= file.len() || file_pos >= end {
                 break;
             }
 
-            // Get next placeholder position for boundary checking
             let following_placeholder = if next_placeholder_index < placeholder.offsets.len() {
                 placeholder.offsets[next_placeholder_index]
             } else {
                 end
             };
 
-            // Copy until null byte, next placeholder, or end
             while file_pos < file.len()
                 && file_pos < end
                 && file_pos < following_placeholder
@@ -142,18 +131,15 @@ pub fn binary_prefix_replacement(
                 file_pos += 1;
             }
 
-            // If we hit a null byte, copy it & add the padding after the string content
             if file_pos < file.len() && file_pos < end && file[file_pos] == b'\x00' {
                 buffer_pos += unfinished_replacements * length_change;
                 unfinished_replacements = 0;
             }
         } else if file[file_pos] == b'\x00' && next_placeholder < end && unfinished_replacements > 0
         {
-            // buffer_pos += 1; // the already existing null byte
             buffer_pos += unfinished_replacements * length_change;
             unfinished_replacements = 0;
         } else {
-            // Regular copy
             buffer[buffer_pos] = file[file_pos];
             buffer_pos += 1;
             file_pos += 1;
@@ -162,20 +148,22 @@ pub fn binary_prefix_replacement(
     buffer
 }
 
-/// Within the prefix replacement function
-pub fn find_unfinished_replacements(file_before: Vec<u8>, offsets: Vec<usize>) -> usize {
-    // there is at least one offset before
-    let last_nul_byte = match memmem::rfind(&file_before, b"\x00") {
-        Some(last_nul_byte) => last_nul_byte,
-        None => 0,
-    };
-    if offsets.last().unwrap() < &last_nul_byte {
-        // the last 0 byte is after the last prefix meaning there is no unfinished replacement
+pub fn find_unfinished_replacements(file_before: &[u8], offsets: &[usize]) -> usize {
+    if offsets.is_empty() {
         return 0;
     }
+
+    let last_nul_byte = match memmem::rfind(file_before, b"\x00") {
+        Some(pos) => pos,
+        None => 0,
+    };
+
+    if offsets.last().unwrap() < &last_nul_byte {
+        return 0;
+    }
+
     let mut unfinished_replacements = 0;
-    let reversed_offsets: Vec<usize> = offsets.into_iter().rev().collect();
-    for offset in reversed_offsets {
+    for &offset in offsets.iter().rev() {
         if offset >= last_nul_byte {
             unfinished_replacements += 1;
         } else {
@@ -183,67 +171,4 @@ pub fn find_unfinished_replacements(file_before: Vec<u8>, offsets: Vec<usize>) -
         }
     }
     unfinished_replacements
-}
-
-#[cfg(test)]
-mod tests {
-    use memmap2::MmapOptions;
-    use rattler_conda_types::package::{FileMode, PrefixPlaceholder};
-
-    use super::*;
-
-    fn mmap_bytes(bytes: &[u8]) -> Mmap {
-        let mut mmap = MmapOptions::new().len(bytes.len()).map_anon().unwrap();
-        mmap[..].copy_from_slice(bytes);
-        mmap.make_read_only().unwrap()
-    }
-
-    fn replacement(file_mode: FileMode, placeholder: &str, bytes: &[u8]) -> PrefixReplacement {
-        PrefixReplacement::from_placeholder(
-            PrefixPlaceholder {
-                file_mode,
-                placeholder: placeholder.to_string(),
-            },
-            bytes,
-        )
-    }
-
-    #[test]
-    fn metadata_collects_prefix_offsets() {
-        let bytes = b"ABCD0123ABCD";
-        let replacement = replacement(FileMode::Text, "ABCD", bytes);
-
-        assert_eq!(replacement.offsets, vec![0, 8]);
-    }
-
-    #[test]
-    fn text_replacement_returns_shortened_virtual_range() {
-        let bytes = b"ABCD0ABCD5ABCD0";
-        let mmap = mmap_bytes(bytes);
-        let replacement = replacement(FileMode::Text, "ABCD", bytes);
-        let mount_point = PathBuf::from("XY");
-
-        let result = text_prefix_replacement(&replacement, 2, 9, 7, &mmap, &mount_point);
-
-        assert_eq!(result, b"0XY5XY0");
-    }
-
-    #[test]
-    fn binary_replacement_pads_shorter_prefix_with_nuls() {
-        let bytes = b"ABCD\x000ABCD\x00";
-        let mmap = mmap_bytes(bytes);
-        let replacement = replacement(FileMode::Binary, "ABCD", bytes);
-        let mount_point = PathBuf::from("XY");
-
-        let result = binary_prefix_replacement(
-            &replacement,
-            0,
-            bytes.len(),
-            bytes.len(),
-            &mmap,
-            &mount_point,
-        );
-
-        assert_eq!(result, b"XY\x00\x00\x000XY\x00\x00\x00");
-    }
 }

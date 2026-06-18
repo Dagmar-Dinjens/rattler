@@ -1,5 +1,6 @@
 use std::{path::PathBuf, sync::Arc};
 
+use anyhow::Context;
 use async_trait::async_trait;
 
 use crate::{
@@ -10,6 +11,8 @@ use crate::{
 
 use nfs3_server::tcp::{NFSTcp, NFSTcpListener};
 
+const NFS_ADDR: &str = "127.0.0.1:11111";
+
 pub struct NfsProvider;
 
 pub struct NfsSession {
@@ -19,10 +22,20 @@ pub struct NfsSession {
 
 impl MountSession for NfsSession {
     fn unmount(self: Box<Self>) -> anyhow::Result<()> {
-        println!("Unmounting {:?}", self.mount_point);
+        // Unmount the OS-level filesystem first, then drop the server.
+        let status = std::process::Command::new("umount")
+            .arg(&self.mount_point)
+            .status()
+            .context("failed to run umount")?;
+
+        if !status.success() {
+            eprintln!(
+                "umount exited with {:?} — server still stopping",
+                status.code()
+            );
+        }
 
         drop(self.server_thread);
-
         Ok(())
     }
 }
@@ -33,10 +46,8 @@ impl MountProvider for NfsProvider {
         fs: Arc<VirtualFSCore>,
         mount_point: PathBuf,
     ) -> anyhow::Result<Box<dyn MountSession>> {
-        let addr = "127.0.0.1:11111".to_string();
         let filesystem = NfsFS { inner: fs };
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
-        let server_addr = addr.clone();
 
         let server_thread = std::thread::spawn(move || {
             let runtime = tokio::runtime::Builder::new_current_thread()
@@ -44,7 +55,7 @@ impl MountProvider for NfsProvider {
                 .build()?;
 
             runtime.block_on(async move {
-                let listener = match NFSTcpListener::bind_ro(&server_addr, filesystem).await {
+                let listener = match NFSTcpListener::bind_ro(NFS_ADDR, filesystem).await {
                     Ok(listener) => {
                         let _ = ready_tx.send(Ok(()));
                         listener
@@ -64,7 +75,46 @@ impl MountProvider for NfsProvider {
             .map_err(|_| anyhow::anyhow!("NFS server thread exited before binding"))?
             .map_err(|err| anyhow::anyhow!("failed binding NFS listener: {err}"))?;
 
-        println!("NFS server started on {}", addr);
+        eprintln!("NFS server listening on {NFS_ADDR}");
+
+        // Mount the NFS export at the requested path.
+        // Requires either root or appropriate system permissions.
+        // The nfs3_server crate serves portmapper, mountd, and NFS3 all on the
+        // same TCP port. We must specify both `port` and `mountport` so that
+        // mount_nfs skips the system portmapper (port 111) entirely and talks
+        // directly to our server for both the mount handshake and NFS I/O.
+        #[cfg(target_os = "macos")]
+        let status = std::process::Command::new("mount_nfs")
+            .args([
+                "-o",
+                "vers=3,tcp,port=11111,mountport=11111,nolockd,nolock,soft,intr,noresvport",
+            ])
+            .arg("127.0.0.1:/")
+            .arg(&mount_point)
+            .status()
+            .context("failed to run mount_nfs — try running with sudo")?;
+
+        #[cfg(target_os = "linux")]
+        let status = std::process::Command::new("mount")
+            .args([
+                "-t",
+                "nfs",
+                "-o",
+                "vers=3,tcp,port=11111,mountport=11111,soft,nolock",
+                "127.0.0.1:/",
+            ])
+            .arg(&mount_point)
+            .status()
+            .context("failed to run mount — try running with sudo")?;
+
+        if !status.success() {
+            return Err(anyhow::anyhow!(
+                "mount command failed with exit code {:?}",
+                status.code()
+            ));
+        }
+
+        eprintln!("mounted at {}", mount_point.display());
 
         Ok(Box::new(NfsSession {
             mount_point,

@@ -26,7 +26,7 @@ compio = { version = "0.14", features = [
     "signal",
 ] }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
-
+tempfile = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_lock = { workspace = true }
