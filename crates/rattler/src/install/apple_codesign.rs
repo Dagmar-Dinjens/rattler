@@ -19,7 +19,7 @@ pub enum AppleCodeSignBehavior {
 /// Sign a binary using the `codesign` tool with an ad-hoc certificate on macOS.
 /// This is required for binaries to run on macOS when their signature has been invalidated
 /// by prefix replacement (modifying binary content). The function preserves existing entitlements.
-pub(crate) fn codesign(destination_path: &Path) -> Result<(), LinkFileError> {
+pub fn codesign(destination_path: &Path) -> Result<(), LinkFileError> {
     let status = std::process::Command::new("/usr/bin/codesign")
         .arg("--sign")
         // Use an ad-hoc certificate (`-`)

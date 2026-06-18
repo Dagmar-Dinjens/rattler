@@ -39,7 +39,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-pub use apple_codesign::AppleCodeSignBehavior;
+pub use apple_codesign::{AppleCodeSignBehavior, codesign};
 pub use clobber_registry::ClobberMode;
 pub use driver::InstallDriver;
 use fs_err::tokio as tokio_fs;

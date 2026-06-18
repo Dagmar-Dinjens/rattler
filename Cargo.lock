@@ -5909,6 +5909,7 @@ dependencies = [
  "memmap2",
  "nfs3_server",
  "nfs3_types",
+ "rattler",
  "rattler_cache",
  "rattler_conda_types",
  "rattler_lock",
