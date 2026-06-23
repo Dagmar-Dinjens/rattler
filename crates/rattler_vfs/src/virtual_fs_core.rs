@@ -13,16 +13,25 @@ use std::{
     },
 };
 
+#[cfg(target_os = "macos")]
+use crate::codesign;
+
 use memmap2::Mmap;
 
 use crate::metadata::{FSFile, FSMetadata};
 
 pub struct VirtualFSCore {
+    /// The filesystem tree in which the files are stored
     metadata: Vec<FSMetadata>,
+    /// Which 
     mount_point: PathBuf,
+    /// Current files 
     open_files: Mutex<HashMap<u64, Mmap>>,
     open_handles: Mutex<HashMap<usize, u64>>,
     next_fh: AtomicU64,
+    /// Lazily-populated cache for Mach-O binaries after binary prefix replacement
+    /// and in-place re-signing. Keyed by metadata index. macOS only.
+    codesign_cache: Mutex<HashMap<usize, Vec<u8>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,6 +60,7 @@ impl VirtualFSCore {
             open_files: Mutex::new(HashMap::new()),
             open_handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
+            codesign_cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -104,18 +114,19 @@ impl VirtualFSCore {
 
             FSMetadata::FSFile(file) => {
                 let is_symlink = file.path_type == PathType::SoftLink;
+
                 let path = self.get_path(file);
                 let meta = std::fs::metadata(&path)?;
 
+                let raw_perm = (meta.permissions().mode() & 0o777) as u16;
+                // Conda packages store executables as 0o555 (no write).
+                // A real rattler install adds the owner-write bit, so mirror that.
+                let perm = if is_symlink { 0o777 } else { raw_perm | 0o200 };
                 Ok(VirtualAttr {
                     is_dir: false,
                     is_symlink,
                     size: meta.len(),
-                    perm: if is_symlink {
-                        0o777
-                    } else {
-                        (meta.permissions().mode() & 0o777) as u16
-                    },
+                    perm,
                     uid: unsafe { libc::getuid() },
                     gid: unsafe { libc::getgid() },
                 })
@@ -133,16 +144,16 @@ impl VirtualFSCore {
             .ino_to_index(ino)
             .ok_or_else(|| anyhow!("invalid ino {ino}"))?;
 
+        let file = self.metadata[idx]
+            .as_file()
+            .ok_or_else(|| anyhow!("not a file"))?;
+
         {
             let handles = self.open_handles.lock().unwrap();
             if let Some(&fh) = handles.get(&idx) {
                 return Ok(fh);
             }
         }
-
-        let file = self.metadata[idx]
-            .as_file()
-            .ok_or_else(|| anyhow!("not a file"))?;
 
         let path = self.get_path(file);
         let fd = File::open(path)?;
@@ -173,37 +184,84 @@ impl VirtualFSCore {
             .as_file()
             .ok_or_else(|| anyhow!("not a file"))?;
 
+        if let Some(placeholder) = &file_meta.prefix_placeholder {
+            match placeholder.file_mode {
+                FileMode::Text => {
+                    let open_files = self.open_files.lock().unwrap();
+                    let mmap = open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
+                    if offset >= mmap.len() {
+                        return Ok(vec![]);
+                    }
+                    let end = offset.saturating_add(size).min(mmap.len());
+                    return Ok(text_prefix_replacement(
+                        placeholder, offset, end, size, mmap, &self.mount_point,
+                    ));
+                }
+                FileMode::Binary => {
+                    #[cfg(target_os = "macos")]
+                    {
+                        // Fast path: serve from codesign cache.
+                        {
+                            let cache = self.codesign_cache.lock().unwrap();
+                            if let Some(cached) = cache.get(&idx) {
+                                let start = offset.min(cached.len());
+                                let end = start.saturating_add(size).min(cached.len());
+                                return Ok(cached[start..end].to_vec());
+                            }
+                        }
+
+                        // Slow path: apply prefix replacement to the whole file,
+                        // re-sign the page hashes in-place, then cache.
+                        let mut replaced = {
+                            let open_files = self.open_files.lock().unwrap();
+                            let mmap =
+                                open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
+                            let file_len = mmap.len();
+                            binary_prefix_replacement(
+                                placeholder,
+                                0,
+                                file_len,
+                                file_len,
+                                mmap,
+                                &self.mount_point,
+                            )
+                        };
+
+                        if let Err(e) = codesign::adhoc_resign(&mut replaced) {
+                            eprintln!("adhoc_resign: {e}");
+                        }
+
+                        let start = offset.min(replaced.len());
+                        let end = start.saturating_add(size).min(replaced.len());
+                        let result = replaced[start..end].to_vec();
+                        self.codesign_cache.lock().unwrap().insert(idx, replaced);
+                        return Ok(result);
+                    }
+
+                    // Non-macOS: ranged binary replacement, no signing needed.
+                    #[cfg(not(target_os = "macos"))]
+                    {
+                        let open_files = self.open_files.lock().unwrap();
+                        let mmap = open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
+                        if offset >= mmap.len() {
+                            return Ok(vec![]);
+                        }
+                        let end = offset.saturating_add(size).min(mmap.len());
+                        return Ok(binary_prefix_replacement(
+                            placeholder, offset, end, size, mmap, &self.mount_point,
+                        ));
+                    }
+                }
+            }
+        }
+
         let open_files = self.open_files.lock().unwrap();
         let mmap = open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
-
         if offset >= mmap.len() {
             return Ok(vec![]);
         }
-
         let end = offset.saturating_add(size).min(mmap.len());
-
-        match &file_meta.prefix_placeholder {
-            Some(placeholder) => match placeholder.file_mode {
-                FileMode::Text => Ok(text_prefix_replacement(
-                    placeholder,
-                    offset,
-                    end,
-                    size,
-                    mmap,
-                    &self.mount_point,
-                )),
-                FileMode::Binary => Ok(binary_prefix_replacement(
-                    placeholder,
-                    offset,
-                    end,
-                    size,
-                    mmap,
-                    &self.mount_point,
-                )),
-            },
-
-            None => Ok(mmap[offset..end].to_vec()),
-        }
+        Ok(mmap[offset..end].to_vec())
     }
 
     /// `ino` is a 1-based inode number. Returns the symlink target bytes.

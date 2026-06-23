@@ -16,6 +16,7 @@ libc = "0.2"
 
 memchr = { workspace = true }
 memmap2 = { workspace = true }
+sha2 = { workspace = true }
 
 nfs3_server = "0.5"
 nfs3_types = "0.3.4"
@@ -27,7 +28,7 @@ compio = { version = "0.14", features = [
 ] }
 tokio = { workspace = true, features = ["rt", "net", "io-util", "sync", "time"] }
 tempfile = { workspace = true }
-rattler = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_lock = { workspace = true }
+

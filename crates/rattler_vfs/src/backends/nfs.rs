@@ -55,7 +55,7 @@ impl MountProvider for NfsProvider {
                 .build()?;
 
             runtime.block_on(async move {
-                let listener = match NFSTcpListener::bind_ro(NFS_ADDR, filesystem).await {
+                let listener = match NFSTcpListener::bind(NFS_ADDR, filesystem).await {
                     Ok(listener) => {
                         let _ = ready_tx.send(Ok(()));
                         listener

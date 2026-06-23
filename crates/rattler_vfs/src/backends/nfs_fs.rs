@@ -1,10 +1,12 @@
 use std::{ffi::OsStr, os::unix::ffi::OsStrExt, sync::Arc};
 
 use nfs3_server::vfs::{
-    FileHandleU64, NextResult, NfsReadFileSystem, ReadDirIterator, ReadDirPlusIterator,
+    FileHandleU64, NextResult, NfsFileSystem, NfsReadFileSystem, ReadDirIterator,
+    ReadDirPlusIterator,
 };
 use nfs3_types::nfs3::{
     Nfs3Option, entryplus3, fattr3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, post_op_attr,
+    sattr3,
 };
 
 use crate::virtual_fs_core::{DirectoryEntry, VirtualAttr, VirtualFSCore};
@@ -122,6 +124,82 @@ impl NfsReadFileSystem for NfsFS {
         let ino = handle_to_ino(id)?;
         let target: Vec<u8> = self.inner.readlink(ino).map_err(nfs_error)?;
         Ok(nfspath3::from(target))
+    }
+}
+
+// Implement the full NfsFileSystem trait so that the ACCESS handler reports
+// VFSCapabilities::ReadWrite (the default). With bind_ro / ReadOnly capabilities
+// the handler strips ACCESS3_EXECUTE, preventing execve() from the NFS mount.
+// All mutating operations return ROFS — the filesystem is effectively read-only.
+impl NfsFileSystem for NfsFS {
+    async fn setattr(
+        &self,
+        _id: &FileHandleU64,
+        _setattr: sattr3,
+    ) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn write(
+        &self,
+        _id: &FileHandleU64,
+        _offset: u64,
+        _data: &[u8],
+    ) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn create(
+        &self,
+        _dirid: &FileHandleU64,
+        _filename: &filename3<'_>,
+        _attr: sattr3,
+    ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn create_exclusive(
+        &self,
+        _dirid: &FileHandleU64,
+        _filename: &filename3<'_>,
+    ) -> Result<FileHandleU64, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn mkdir(
+        &self,
+        _dirid: &FileHandleU64,
+        _dirname: &filename3<'_>,
+    ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn remove(
+        &self,
+        _dirid: &FileHandleU64,
+        _filename: &filename3<'_>,
+    ) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn rename<'a>(
+        &self,
+        _from_dirid: &FileHandleU64,
+        _from_filename: &filename3<'a>,
+        _to_dirid: &FileHandleU64,
+        _to_filename: &filename3<'a>,
+    ) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    async fn symlink<'a>(
+        &self,
+        _dirid: &FileHandleU64,
+        _linkname: &filename3<'a>,
+        _symlink: &nfspath3<'a>,
+        _attr: &sattr3,
+    ) -> Result<(FileHandleU64, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
     }
 }
 
