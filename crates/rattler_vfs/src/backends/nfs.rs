@@ -131,22 +131,20 @@ impl MountProvider for NfsProvider {
 #[cfg(target_os = "linux")]
 fn linux_nfs_mount(mount_point: &std::path::Path) -> anyhow::Result<()> {
     // mount.nfs is setuid root on most distros; fall back to plain `mount -t nfs`.
+    //
+    // We do NOT specify port= or mountport= here. With rpcbind running (and our
+    // programs registered at port 11111), mount.nfs discovers the ports via
+    // portmapper itself in userspace, obtains the root filehandle via the MOUNT
+    // protocol, and passes the binary nfs_mount_data to mount(2). This avoids
+    // the "text-based options" kernel path where the kernel has to contact
+    // portmapper on its own.
     let output = std::process::Command::new("mount.nfs")
-        .args([
-            "-o",
-            "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,actimeo=120,addr=127.0.0.1",
-            "127.0.0.1:/",
-        ])
+        .args(["-o", "nolock,nfsvers=3,tcp", "127.0.0.1:/"])
         .arg(mount_point)
         .output()
         .or_else(|_| {
             std::process::Command::new("mount")
-                .args([
-                    "-t", "nfs",
-                    "-o",
-                    "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,actimeo=120,addr=127.0.0.1",
-                    "127.0.0.1:/",
-                ])
+                .args(["-t", "nfs", "-o", "nolock,nfsvers=3,tcp", "127.0.0.1:/"])
                 .arg(mount_point)
                 .output()
         })
