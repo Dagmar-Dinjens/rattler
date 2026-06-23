@@ -101,7 +101,14 @@ impl MountProvider for NfsProvider {
             // Tell the system portmapper (if running) about our server so the
             // kernel NFS client can discover it on port 11111.
             let rpcbind_running = rpcbind_register(NFS_PORT);
-            eprintln!("rpcbind registration: {}", if rpcbind_running { "ok" } else { "skipped (rpcbind not running)" });
+            eprintln!(
+                "rpcbind registration: {}",
+                if rpcbind_running {
+                    "ok"
+                } else {
+                    "skipped (rpcbind not running)"
+                }
+            );
 
             linux_nfs_mount(&mount_point)?;
         }
@@ -123,65 +130,68 @@ impl MountProvider for NfsProvider {
     }
 }
 
-/// Shell out to mount.nfs (which is setuid root on most distros) so we don't
-/// need CAP_SYS_ADMIN ourselves. Options match the nfs3_server README example.
-/// After any failure we also grab the last few dmesg lines to surface the real
-/// kernel error that mount.nfs otherwise hides behind "failed to apply fstab
-/// options".
+/// Mount the NFS server at 127.0.0.1:11111 (registered with rpcbind).
+///
+/// mount(2) / mount.nfs require CAP_SYS_ADMIN. We try, in order:
+///   1. `sudo -n mount.nfs`  — passwordless-sudo path
+///   2. `mount.nfs`          — direct (works if the process is already root)
+///   3. `mount -t nfs`       — fallback for distros without mount.nfs in PATH
+///
+/// If every attempt fails the error includes a hint about privilege requirements.
 #[cfg(target_os = "linux")]
 fn linux_nfs_mount(mount_point: &std::path::Path) -> anyhow::Result<()> {
-    // mount.nfs is setuid root on most distros; fall back to plain `mount -t nfs`.
-    //
-    // We do NOT specify port= or mountport= here. With rpcbind running (and our
-    // programs registered at port 11111), mount.nfs discovers the ports via
-    // portmapper itself in userspace, obtains the root filehandle via the MOUNT
-    // protocol, and passes the binary nfs_mount_data to mount(2). This avoids
-    // the "text-based options" kernel path where the kernel has to contact
-    // portmapper on its own.
-    let output = std::process::Command::new("mount.nfs")
-        .args(["-o", "nolock,nfsvers=3,tcp", "127.0.0.1:/"])
-        .arg(mount_point)
-        .output()
-        .or_else(|_| {
-            std::process::Command::new("mount")
-                .args(["-t", "nfs", "-o", "nolock,nfsvers=3,tcp", "127.0.0.1:/"])
-                .arg(mount_point)
-                .output()
-        })
-        .context("failed to run mount.nfs / mount — is nfs-utils installed?")?;
+    // With rpcbind running and our programs registered on port 11111, mount.nfs
+    // discovers the ports via portmapper in userspace (binary-mode mount), so
+    // we do NOT specify port= or mountport= here.
+    let opts = "nolock,nfsvers=3,tcp";
+    let source = "127.0.0.1:/";
+    let target = mount_point;
 
-    if output.status.success() {
-        return Ok(());
+    // Try each candidate in order, stop at the first one that runs (even if it
+    // fails — we want that specific failure, not an exec-not-found error).
+    let candidates: &[&[&str]] = &[
+        &["sudo", "-n", "mount.nfs", "-o", opts, source],
+        &["mount.nfs", "-o", opts, source],
+        &["mount", "-t", "nfs", "-o", opts, source],
+    ];
+
+    let mut last_err = String::new();
+    for argv in candidates {
+        let Ok(output) = std::process::Command::new(argv[0])
+            .args(&argv[1..])
+            .arg(target)
+            .output()
+        else {
+            continue; // binary not found / not executable
+        };
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        last_err = format!(
+            "{} (exit {:?}): stdout={} stderr={}",
+            argv[0],
+            output.status.code(),
+            stdout.trim(),
+            stderr.trim()
+        );
+
+        // "failed to apply fstab options" = privilege check inside mount.nfs.
+        // Try the next candidate (sudo might succeed where non-sudo fails).
+        // For any other error the mount itself is failing; stop trying.
+        let combined = format!("{stdout}{stderr}");
+        if !combined.contains("fstab") {
+            break;
+        }
     }
 
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    let stdout = String::from_utf8_lossy(&output.stdout);
-
-    // Grab dmesg to expose the actual kernel errno that mount.nfs masks.
-    let dmesg = std::process::Command::new("dmesg")
-        .args(["--notime", "-l", "err,warn"])
-        .output()
-        .ok()
-        .map(|o| {
-            let raw = String::from_utf8_lossy(&o.stdout);
-            // Last 10 lines most relevant.
-            raw.lines()
-                .rev()
-                .take(10)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n")
-        })
-        .unwrap_or_default();
-
     Err(anyhow::anyhow!(
-        "mount.nfs failed (exit {:?})\nstdout: {}\nstderr: {}\ndmesg (errors):\n{}",
-        output.status.code(),
-        stdout.trim(),
-        stderr.trim(),
-        dmesg.trim(),
+        "{last_err}\n\nHint: NFS mounting on Linux requires CAP_SYS_ADMIN. \
+         Run the process as root, or add a passwordless sudo rule:\n  \
+         %user ALL=(root) NOPASSWD: /sbin/mount.nfs"
     ))
 }
 
@@ -193,10 +203,9 @@ fn rpcbind_register(port: u16) -> bool {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &"127.0.0.1:111".parse().unwrap(),
-        Duration::from_secs(1),
-    ) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&"127.0.0.1:111".parse().unwrap(), Duration::from_secs(1))
+    else {
         return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -224,10 +233,9 @@ fn rpcbind_unregister(port: u16) {
     use std::net::TcpStream;
     use std::time::Duration;
 
-    let Ok(mut stream) = TcpStream::connect_timeout(
-        &"127.0.0.1:111".parse().unwrap(),
-        Duration::from_secs(1),
-    ) else {
+    let Ok(mut stream) =
+        TcpStream::connect_timeout(&"127.0.0.1:111".parse().unwrap(), Duration::from_secs(1))
+    else {
         return;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
@@ -254,10 +262,20 @@ fn pmap_request(proc: u32, prog: u32, vers: u32, port: u16) -> Vec<u8> {
     let mut payload = Vec::with_capacity(56);
     let mut w = |n: u32| payload.extend_from_slice(&n.to_be_bytes());
 
-    w(prog); w(0); w(2); w(100_000); w(2); w(proc);
-    w(0); w(0); // cred: AUTH_NULL
-    w(0); w(0); // verf: AUTH_NULL
-    w(prog); w(vers); w(6); w(port as u32); // mapping: prog, vers, IPPROTO_TCP, port
+    w(prog);
+    w(0);
+    w(2);
+    w(100_000);
+    w(2);
+    w(proc);
+    w(0);
+    w(0); // cred: AUTH_NULL
+    w(0);
+    w(0); // verf: AUTH_NULL
+    w(prog);
+    w(vers);
+    w(6);
+    w(port as u32); // mapping: prog, vers, IPPROTO_TCP, port
 
     let mut msg = Vec::with_capacity(4 + payload.len());
     msg.extend_from_slice(&((payload.len() as u32) | 0x8000_0000).to_be_bytes());
