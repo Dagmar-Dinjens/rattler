@@ -100,7 +100,7 @@ impl MountProvider for NfsProvider {
                 "-t",
                 "nfs",
                 "-o",
-                "vers=3,tcp,port=11111,mountport=11111,soft,nolock",
+                "vers=3,proto=tcp,port=11111,mountport=11111,mountproto=tcp,soft,nolock",
                 "127.0.0.1:/",
             ])
             .arg(&mount_point)
