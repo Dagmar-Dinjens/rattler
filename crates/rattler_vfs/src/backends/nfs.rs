@@ -103,8 +103,6 @@ impl MountProvider for NfsProvider {
             let rpcbind_running = rpcbind_register(NFS_PORT);
             eprintln!("rpcbind registration: {}", if rpcbind_running { "ok" } else { "skipped (rpcbind not running)" });
 
-            // Call mount(2) directly via libc so we get the real errno instead of
-            // mount.nfs's generic "failed to apply fstab options" message.
             linux_nfs_mount(&mount_point)?;
         }
 
@@ -125,45 +123,68 @@ impl MountProvider for NfsProvider {
     }
 }
 
-/// Call mount(2) directly for an NFSv3 TCP mount on localhost:11111.
-/// Using libc directly (rather than shelling out to mount.nfs) gives us the
-/// real errno instead of the generic "failed to apply fstab options" message.
+/// Shell out to mount.nfs (which is setuid root on most distros) so we don't
+/// need CAP_SYS_ADMIN ourselves. Options match the nfs3_server README example.
+/// After any failure we also grab the last few dmesg lines to surface the real
+/// kernel error that mount.nfs otherwise hides behind "failed to apply fstab
+/// options".
 #[cfg(target_os = "linux")]
 fn linux_nfs_mount(mount_point: &std::path::Path) -> anyhow::Result<()> {
-    use std::ffi::CString;
+    // mount.nfs is setuid root on most distros; fall back to plain `mount -t nfs`.
+    let output = std::process::Command::new("mount.nfs")
+        .args([
+            "-o",
+            "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,actimeo=120,addr=127.0.0.1",
+            "127.0.0.1:/",
+        ])
+        .arg(mount_point)
+        .output()
+        .or_else(|_| {
+            std::process::Command::new("mount")
+                .args([
+                    "-t", "nfs",
+                    "-o",
+                    "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,actimeo=120,addr=127.0.0.1",
+                    "127.0.0.1:/",
+                ])
+                .arg(mount_point)
+                .output()
+        })
+        .context("failed to run mount.nfs / mount — is nfs-utils installed?")?;
 
-    let source = CString::new("127.0.0.1:/").unwrap();
-    let target = CString::new(
-        mount_point
-            .to_str()
-            .context("mount point is not valid UTF-8")?,
-    )
-    .unwrap();
-    let fstype = CString::new("nfs").unwrap();
-
-    // Pass the same options that mount.nfs would assemble.
-    // addr= must be specified explicitly when bypassing mount.nfs.
-    let opts = CString::new(
-        "vers=3,tcp,port=11111,mountport=11111,soft,nolock,noresvport,addr=127.0.0.1",
-    )
-    .unwrap();
-
-    let ret = unsafe {
-        libc::mount(
-            source.as_ptr(),
-            target.as_ptr(),
-            fstype.as_ptr(),
-            0,
-            opts.as_ptr() as *const libc::c_void,
-        )
-    };
-
-    if ret != 0 {
-        let err = std::io::Error::last_os_error();
-        Err(anyhow::anyhow!("mount(2) failed: {err}"))
-    } else {
-        Ok(())
+    if output.status.success() {
+        return Ok(());
     }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Grab dmesg to expose the actual kernel errno that mount.nfs masks.
+    let dmesg = std::process::Command::new("dmesg")
+        .args(["--notime", "-l", "err,warn"])
+        .output()
+        .ok()
+        .map(|o| {
+            let raw = String::from_utf8_lossy(&o.stdout);
+            // Last 10 lines most relevant.
+            raw.lines()
+                .rev()
+                .take(10)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .unwrap_or_default();
+
+    Err(anyhow::anyhow!(
+        "mount.nfs failed (exit {:?})\nstdout: {}\nstderr: {}\ndmesg (errors):\n{}",
+        output.status.code(),
+        stdout.trim(),
+        stderr.trim(),
+        dmesg.trim(),
+    ))
 }
 
 /// Register NFS3 (100003) and MOUNT (100005) with system rpcbind on port 111.
