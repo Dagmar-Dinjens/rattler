@@ -81,8 +81,8 @@ impl MountProvider for NfsProvider {
         // Requires either root or appropriate system permissions.
         // The nfs3_server crate serves portmapper, mountd, and NFS3 all on the
         // same TCP port. We must specify both `port` and `mountport` so that
-        // mount_nfs skips the system portmapper (port 111) entirely and talks
-        // directly to our server for both the mount handshake and NFS I/O.
+        // the client skips the system portmapper (port 111) and talks directly
+        // to our server. `noresvport` avoids requiring a privileged source port.
         #[cfg(target_os = "macos")]
         let status = std::process::Command::new("mount_nfs")
             .args([
@@ -95,18 +95,40 @@ impl MountProvider for NfsProvider {
             .context("failed to run mount_nfs — try running with sudo")?;
 
         #[cfg(target_os = "linux")]
-        let status = std::process::Command::new("mount")
+        let output = std::process::Command::new("mount.nfs")
             .args([
-                "-t",
-                "nfs",
                 "-o",
-                "vers=3,proto=tcp,port=11111,mountport=11111,mountproto=tcp,soft,nolock",
+                "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,soft,noresvport",
                 "127.0.0.1:/",
             ])
             .arg(&mount_point)
-            .status()
-            .context("failed to run mount — try running with sudo")?;
+            .output()
+            .or_else(|_| {
+                // Fall back to `mount -t nfs` if mount.nfs is not in PATH.
+                std::process::Command::new("mount")
+                    .args([
+                        "-t",
+                        "nfs",
+                        "-o",
+                        "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,soft,noresvport",
+                        "127.0.0.1:/",
+                    ])
+                    .arg(&mount_point)
+                    .output()
+            })
+            .context("failed to run mount.nfs / mount — try running with sudo")?;
 
+        #[cfg(target_os = "linux")]
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!(
+                "mount command failed with exit code {:?}: {}",
+                output.status.code(),
+                stderr.trim()
+            ));
+        }
+
+        #[cfg(not(target_os = "linux"))]
         if !status.success() {
             return Err(anyhow::anyhow!(
                 "mount command failed with exit code {:?}",
