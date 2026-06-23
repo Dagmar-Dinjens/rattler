@@ -5,13 +5,14 @@ use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
     fs::File,
-    os::unix::fs::PermissionsExt,
     path::PathBuf,
     sync::{
         Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 
 #[cfg(target_os = "macos")]
 use crate::codesign;
@@ -102,14 +103,19 @@ impl VirtualFSCore {
 
         let entry = &self.metadata[idx];
 
+        #[cfg(unix)]
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        #[cfg(not(unix))]
+        let (uid, gid) = (0u32, 0u32);
+
         match entry {
             FSMetadata::FSDirectory(_) => Ok(VirtualAttr {
                 is_dir: true,
                 is_symlink: false,
                 size: 0,
                 perm: 0o755,
-                uid: unsafe { libc::getuid() },
-                gid: unsafe { libc::getgid() },
+                uid,
+                gid,
             }),
 
             FSMetadata::FSFile(file) => {
@@ -118,7 +124,11 @@ impl VirtualFSCore {
                 let path = self.get_path(file);
                 let meta = std::fs::metadata(&path)?;
 
+                #[cfg(unix)]
                 let raw_perm = (meta.permissions().mode() & 0o777) as u16;
+                #[cfg(not(unix))]
+                let raw_perm: u16 = if meta.permissions().readonly() { 0o555 } else { 0o755 };
+
                 // Conda packages store executables as 0o555 (no write).
                 // A real rattler install adds the owner-write bit, so mirror that.
                 let perm = if is_symlink { 0o777 } else { raw_perm | 0o200 };
@@ -127,8 +137,8 @@ impl VirtualFSCore {
                     is_symlink,
                     size: meta.len(),
                     perm,
-                    uid: unsafe { libc::getuid() },
-                    gid: unsafe { libc::getgid() },
+                    uid,
+                    gid,
                 })
             }
         }

@@ -1,5 +1,8 @@
+#[cfg(unix)]
 pub mod nfs;
+#[cfg(unix)]
 pub mod nfs_fs;
+
 use std::path::PathBuf;
 
 use crate::{

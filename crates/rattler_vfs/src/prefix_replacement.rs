@@ -1,6 +1,6 @@
 use memchr::memmem;
 use memmap2::Mmap;
-use std::{os::unix::ffi::OsStrExt, path::Path};
+use std::path::Path;
 
 use crate::metadata::CustomPrefixPlaceholder;
 
@@ -17,7 +17,8 @@ pub fn text_prefix_replacement(
     }
 
     let old_prefix = placeholder.placeholder.as_bytes();
-    let new_prefix = mount_point.as_os_str().as_bytes();
+    let new_prefix_str = mount_point.to_string_lossy();
+    let new_prefix = new_prefix_str.as_bytes();
 
     if new_prefix.len() > old_prefix.len() {
         panic!("New prefix is longer than placeholder");
@@ -52,7 +53,8 @@ pub fn binary_prefix_replacement(
     file: &Mmap,
     mount_point: &Path,
 ) -> Vec<u8> {
-    let new_prefix = mount_point.as_os_str().as_bytes();
+    let new_prefix_str = mount_point.to_string_lossy();
+    let new_prefix = new_prefix_str.as_bytes();
     let length_placeholder = placeholder.placeholder.len();
     let length_prefix = new_prefix.len();
 

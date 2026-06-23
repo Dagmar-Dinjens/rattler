@@ -1,7 +1,9 @@
 use async_trait::async_trait;
 use std::{path::PathBuf, sync::Arc};
 
-use crate::{backends::nfs::NfsProvider, metadata::FSMetadata, virtual_fs_core::VirtualFSCore};
+#[cfg(unix)]
+use crate::backends::nfs::NfsProvider;
+use crate::{metadata::FSMetadata, virtual_fs_core::VirtualFSCore};
 
 pub trait MountSession: Send + Sync {
     fn unmount(self: Box<Self>) -> anyhow::Result<()>;
@@ -18,10 +20,16 @@ impl MountBackend {
         metadata: Vec<FSMetadata>,
         mount_point: PathBuf,
     ) -> anyhow::Result<Box<dyn MountSession>> {
-        let fs = Arc::new(VirtualFSCore::new(metadata, mount_point.clone()));
-
         match self {
-            MountBackend::Nfs => NfsProvider::mount(fs, mount_point).await,
+            #[cfg(unix)]
+            MountBackend::Nfs => {
+                let fs = Arc::new(VirtualFSCore::new(metadata, mount_point.clone()));
+                NfsProvider::mount(fs, mount_point).await
+            }
+            #[cfg(not(unix))]
+            MountBackend::Nfs => {
+                anyhow::bail!("NFS backend is not supported on this platform")
+            }
         }
     }
 }
@@ -35,6 +43,7 @@ impl From<&str> for MountBackend {
         }
     }
 }
+
 #[async_trait]
 pub trait MountProvider {
     async fn mount(

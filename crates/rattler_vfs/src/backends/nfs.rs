@@ -24,7 +24,6 @@ pub struct NfsSession {
 
 impl MountSession for NfsSession {
     fn unmount(self: Box<Self>) -> anyhow::Result<()> {
-        // Unmount the OS-level filesystem first, then drop the server.
         let status = std::process::Command::new("umount")
             .arg(&self.mount_point)
             .status()
@@ -82,12 +81,6 @@ impl MountProvider for NfsProvider {
 
         eprintln!("NFS server listening on {NFS_ADDR}");
 
-        // Mount the NFS export at the requested path.
-        // Requires either root or appropriate system permissions.
-        // The nfs3_server crate serves portmapper, mountd, and NFS3 all on the
-        // same TCP port. We must specify both `port` and `mountport` so that
-        // the client skips the system portmapper (port 111) and talks directly
-        // to our server. `noresvport` avoids requiring a privileged source port.
         #[cfg(target_os = "macos")]
         let status = std::process::Command::new("mount_nfs")
             .args([
@@ -101,46 +94,18 @@ impl MountProvider for NfsProvider {
 
         #[cfg(target_os = "linux")]
         {
-            // Register our NFS3 and MOUNT programs with the system portmapper so
-            // the kernel NFS client can find our server even in text-based-options
-            // mode, where the kernel queries rpcbind on port 111 for service
-            // discovery rather than using our explicit port= option directly.
-            rpcbind_register(NFS_PORT);
+            // Verify the server we just started is actually reachable.
+            std::net::TcpStream::connect("127.0.0.1:11111")
+                .context("NFS server not reachable on 127.0.0.1:11111 immediately after start")?;
 
-            let output = std::process::Command::new("mount.nfs")
-                .args([
-                    "-v",
-                    "-o",
-                    "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,soft,noresvport",
-                    "127.0.0.1:/",
-                ])
-                .arg(&mount_point)
-                .output()
-                .or_else(|_| {
-                    // Fall back to `mount -t nfs` if mount.nfs is not in PATH.
-                    std::process::Command::new("mount")
-                        .args([
-                            "-t",
-                            "nfs",
-                            "-v",
-                            "-o",
-                            "noacl,nolock,vers=3,tcp,port=11111,mountport=11111,soft,noresvport",
-                            "127.0.0.1:/",
-                        ])
-                        .arg(&mount_point)
-                        .output()
-                })
-                .context("failed to run mount.nfs / mount — try running with sudo")?;
+            // Tell the system portmapper (if running) about our server so the
+            // kernel NFS client can discover it on port 11111.
+            let rpcbind_running = rpcbind_register(NFS_PORT);
+            eprintln!("rpcbind registration: {}", if rpcbind_running { "ok" } else { "skipped (rpcbind not running)" });
 
-            if !output.status.success() {
-                rpcbind_unregister(NFS_PORT);
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                return Err(anyhow::anyhow!(
-                    "mount command failed with exit code {:?}: {}",
-                    output.status.code(),
-                    stderr.trim()
-                ));
-            }
+            // Call mount(2) directly via libc so we get the real errno instead of
+            // mount.nfs's generic "failed to apply fstab options" message.
+            linux_nfs_mount(&mount_point)?;
         }
 
         #[cfg(not(target_os = "linux"))]
@@ -160,13 +125,51 @@ impl MountProvider for NfsProvider {
     }
 }
 
-/// Register NFS3 (program 100003) and MOUNT (program 100005) with the system
-/// portmapper (rpcbind on port 111) so the kernel NFS client can locate our
-/// server without needing to resolve via the default NFS port (2049).
-///
-/// Silently does nothing if rpcbind is not running.
+/// Call mount(2) directly for an NFSv3 TCP mount on localhost:11111.
+/// Using libc directly (rather than shelling out to mount.nfs) gives us the
+/// real errno instead of the generic "failed to apply fstab options" message.
 #[cfg(target_os = "linux")]
-fn rpcbind_register(port: u16) {
+fn linux_nfs_mount(mount_point: &std::path::Path) -> anyhow::Result<()> {
+    use std::ffi::CString;
+
+    let source = CString::new("127.0.0.1:/").unwrap();
+    let target = CString::new(
+        mount_point
+            .to_str()
+            .context("mount point is not valid UTF-8")?,
+    )
+    .unwrap();
+    let fstype = CString::new("nfs").unwrap();
+
+    // Pass the same options that mount.nfs would assemble.
+    // addr= must be specified explicitly when bypassing mount.nfs.
+    let opts = CString::new(
+        "vers=3,tcp,port=11111,mountport=11111,soft,nolock,noresvport,addr=127.0.0.1",
+    )
+    .unwrap();
+
+    let ret = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            fstype.as_ptr(),
+            0,
+            opts.as_ptr() as *const libc::c_void,
+        )
+    };
+
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        Err(anyhow::anyhow!("mount(2) failed: {err}"))
+    } else {
+        Ok(())
+    }
+}
+
+/// Register NFS3 (100003) and MOUNT (100005) with system rpcbind on port 111.
+/// Returns true if rpcbind was reached, false if it is not running.
+#[cfg(target_os = "linux")]
+fn rpcbind_register(port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
     use std::time::Duration;
@@ -175,31 +178,27 @@ fn rpcbind_register(port: u16) {
         &"127.0.0.1:111".parse().unwrap(),
         Duration::from_secs(1),
     ) else {
-        return;
+        return false;
     };
     let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
-    // NFS3 = program 100003 version 3, MOUNT = program 100005 version 3
     for prog in [100003u32, 100005] {
-        let msg = pmap_set_request(prog, 3, port);
+        let msg = pmap_request(1, prog, 3, port);
         if stream.write_all(&msg).is_err() {
-            return;
+            return false;
         }
-        // Drain the reply (we don't need the result — if rpcbind rejects us,
-        // the explicit port= options in the mount command act as fallback).
         let mut hdr = [0u8; 4];
         if stream.read_exact(&mut hdr).is_err() {
-            return;
+            return false;
         }
         let body_len = (u32::from_be_bytes(hdr) & 0x7FFF_FFFF) as usize;
         let mut body = vec![0u8; body_len];
         let _ = stream.read_exact(&mut body);
     }
+    true
 }
 
-/// Unregister NFS3 and MOUNT programs from rpcbind. Called on unmount so that
-/// stale entries don't block the next session's registration.
 #[cfg(target_os = "linux")]
 fn rpcbind_unregister(port: u16) {
     use std::io::{Read, Write};
@@ -216,7 +215,6 @@ fn rpcbind_unregister(port: u16) {
     let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
 
     for prog in [100003u32, 100005] {
-        // PMAPPROC_UNSET = procedure 2
         let msg = pmap_request(2, prog, 3, port);
         if stream.write_all(&msg).is_err() {
             return;
@@ -231,33 +229,17 @@ fn rpcbind_unregister(port: u16) {
     }
 }
 
-/// Build a TCP-framed portmapper RPC request for PMAPPROC_SET (proc=1) or
-/// PMAPPROC_UNSET (proc=2).
-#[cfg(target_os = "linux")]
-fn pmap_set_request(prog: u32, vers: u32, port: u16) -> Vec<u8> {
-    pmap_request(1, prog, vers, port)
-}
-
+/// Build a TCP-framed portmapper RPC call (PMAPPROC_SET=1 or PMAPPROC_UNSET=2).
 #[cfg(target_os = "linux")]
 fn pmap_request(proc: u32, prog: u32, vers: u32, port: u16) -> Vec<u8> {
     let mut payload = Vec::with_capacity(56);
     let mut w = |n: u32| payload.extend_from_slice(&n.to_be_bytes());
 
-    w(prog);        // XID — use program number for easy correlation
-    w(0);           // msg_type: CALL
-    w(2);           // rpcvers: 2
-    w(100_000);     // portmapper program
-    w(2);           // portmapper version
-    w(proc);        // PMAPPROC_SET=1 or PMAPPROC_UNSET=2
-    w(0); w(0);     // cred: AUTH_NULL, len=0
-    w(0); w(0);     // verf: AUTH_NULL, len=0
-    // struct mapping { prog, vers, prot=IPPROTO_TCP=6, port }
-    w(prog);
-    w(vers);
-    w(6);           // IPPROTO_TCP
-    w(port as u32);
+    w(prog); w(0); w(2); w(100_000); w(2); w(proc);
+    w(0); w(0); // cred: AUTH_NULL
+    w(0); w(0); // verf: AUTH_NULL
+    w(prog); w(vers); w(6); w(port as u32); // mapping: prog, vers, IPPROTO_TCP, port
 
-    // TCP record-marking header: last-fragment bit set, followed by length
     let mut msg = Vec::with_capacity(4 + payload.len());
     msg.extend_from_slice(&((payload.len() as u32) | 0x8000_0000).to_be_bytes());
     msg.extend_from_slice(&payload);
