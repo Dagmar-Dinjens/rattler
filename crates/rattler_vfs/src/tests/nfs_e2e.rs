@@ -6,19 +6,20 @@ mod tests {
 
     use crate::{MountBackend, MountSession, mount_environment};
 
-    // These tests require test data at tests/data/pixi.lock and tests/data/cache.
+    // These tests require test data at src/tests/data/pixi.lock and src/tests/data/cache.
     // Run them with: cargo test -- --ignored
-    #[ignore = "requires test data at tests/data/"]
+    #[ignore = "requires test data at src/tests/data/"]
     #[compio::test]
     async fn test_prefix_replacement_file() -> anyhow::Result<()> {
         let mount_dir = tempdir()?;
 
         let session: Box<dyn MountSession> = mount_environment(
-            PathBuf::from("tests/data/pixi.lock"),
-            PathBuf::from("tests/data/cache"),
+            PathBuf::from("src/tests/data/pixi.lock"),
+            PathBuf::from("src/tests/data/cache"),
             mount_dir.path().to_path_buf(),
             MountBackend::Nfs,
             "default".to_string(),
+            false,
         )
         .await?;
 
@@ -45,17 +46,18 @@ mod tests {
         Ok(())
     }
 
-    #[ignore = "requires test data at tests/data/"]
+    #[ignore = "requires test data at src/tests/data/"]
     #[compio::test]
     async fn test_prefix_replacement_python() -> anyhow::Result<()> {
         let mount_dir = tempdir()?;
 
         let session: Box<dyn MountSession> = mount_environment(
-            PathBuf::from("tests/data/pixi.lock"),
-            PathBuf::from("tests/data/cache"),
+            PathBuf::from("src/tests/data/pixi.lock"),
+            PathBuf::from("src/tests/data/cache"),
             mount_dir.path().to_path_buf(),
             MountBackend::Nfs,
             "default".to_string(),
+            false,
         )
         .await?;
 

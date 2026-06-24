@@ -11,14 +11,23 @@ mod tests {
     fn mmap_bytes(bytes: &[u8]) -> Mmap {
         // map_anon requires len > 0; empty files are handled by returning early in the functions.
         if bytes.is_empty() {
-            return MmapOptions::new().len(1).map_anon().unwrap().make_read_only().unwrap();
+            return MmapOptions::new()
+                .len(1)
+                .map_anon()
+                .unwrap()
+                .make_read_only()
+                .unwrap();
         }
         let mut mmap = MmapOptions::new().len(bytes.len()).map_anon().unwrap();
         mmap[..].copy_from_slice(bytes);
         mmap.make_read_only().unwrap()
     }
 
-    fn make_placeholder(file_mode: FileMode, placeholder: &str, bytes: &[u8]) -> CustomPrefixPlaceholder {
+    fn make_placeholder(
+        file_mode: FileMode,
+        placeholder: &str,
+        bytes: &[u8],
+    ) -> CustomPrefixPlaceholder {
         CustomPrefixPlaceholder::from_placeholder(
             PrefixPlaceholder {
                 file_mode,
@@ -381,14 +390,7 @@ mod tests {
 
     #[test]
     fn test_binary_prefix_replacement_placeholder_at_boundary() {
-        do_binary_test(
-            "ABCD",
-            "XY",
-            b"01234567ABCD",
-            b"01234567XY\x00\x00",
-            0,
-            12,
-        );
+        do_binary_test("ABCD", "XY", b"01234567ABCD", b"01234567XY\x00\x00", 0, 12);
     }
 
     #[test]

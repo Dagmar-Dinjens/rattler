@@ -1,6 +1,8 @@
 use crate::prefix_replacement::{binary_prefix_replacement, text_prefix_replacement};
 use anyhow::anyhow;
 use rattler_conda_types::package::{FileMode, PathType};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::{
     collections::HashMap,
     ffi::{OsStr, OsString},
@@ -11,8 +13,6 @@ use std::{
         atomic::{AtomicU64, Ordering},
     },
 };
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
 
 #[cfg(target_os = "macos")]
 use crate::codesign;
@@ -24,9 +24,9 @@ use crate::metadata::{FSFile, FSMetadata};
 pub struct VirtualFSCore {
     /// The filesystem tree in which the files are stored
     metadata: Vec<FSMetadata>,
-    /// Which 
+    /// Which
     mount_point: PathBuf,
-    /// Current files 
+    /// Current files
     open_files: Mutex<HashMap<u64, Mmap>>,
     open_handles: Mutex<HashMap<usize, u64>>,
     next_fh: AtomicU64,
@@ -122,12 +122,18 @@ impl VirtualFSCore {
                 let is_symlink = file.path_type == PathType::SoftLink;
 
                 let path = self.get_path(file);
-                let meta = std::fs::metadata(&path)?;
+                // Use symlink_metadata so a symlink reports its own attrs (length of
+                // the target path) instead of the target file's stat.
+                let meta = std::fs::symlink_metadata(&path)?;
 
                 #[cfg(unix)]
                 let raw_perm = (meta.permissions().mode() & 0o777) as u16;
                 #[cfg(not(unix))]
-                let raw_perm: u16 = if meta.permissions().readonly() { 0o555 } else { 0o755 };
+                let raw_perm: u16 = if meta.permissions().readonly() {
+                    0o555
+                } else {
+                    0o755
+                };
 
                 // Conda packages store executables as 0o555 (no write).
                 // A real rattler install adds the owner-write bit, so mirror that.
@@ -204,7 +210,12 @@ impl VirtualFSCore {
                     }
                     let end = offset.saturating_add(size).min(mmap.len());
                     return Ok(text_prefix_replacement(
-                        placeholder, offset, end, size, mmap, &self.mount_point,
+                        placeholder,
+                        offset,
+                        end,
+                        size,
+                        mmap,
+                        &self.mount_point,
                     ));
                 }
                 FileMode::Binary => {
@@ -224,8 +235,7 @@ impl VirtualFSCore {
                         // re-sign the page hashes in-place, then cache.
                         let mut replaced = {
                             let open_files = self.open_files.lock().unwrap();
-                            let mmap =
-                                open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
+                            let mmap = open_files.get(&fh).ok_or_else(|| anyhow!("invalid fh"))?;
                             let file_len = mmap.len();
                             binary_prefix_replacement(
                                 placeholder,
@@ -258,7 +268,12 @@ impl VirtualFSCore {
                         }
                         let end = offset.saturating_add(size).min(mmap.len());
                         return Ok(binary_prefix_replacement(
-                            placeholder, offset, end, size, mmap, &self.mount_point,
+                            placeholder,
+                            offset,
+                            end,
+                            size,
+                            mmap,
+                            &self.mount_point,
                         ));
                     }
                 }
@@ -288,7 +303,16 @@ impl VirtualFSCore {
             return Err(anyhow!("not a symlink"));
         }
 
-        Ok(std::fs::read(self.get_path(file))?)
+        let target = std::fs::read_link(self.get_path(file))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            Ok(target.as_os_str().as_bytes().to_vec())
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(target.to_string_lossy().into_owned().into_bytes())
+        }
     }
 
     /// `ino` is a 1-based inode number.

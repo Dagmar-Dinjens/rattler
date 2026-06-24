@@ -1,5 +1,5 @@
 use anyhow::Result;
-use clap::{Arg, Command};
+use clap::{Arg, ArgAction, Command};
 use compio;
 use rattler_cache::{PACKAGE_CACHE_DIR, default_cache_dir};
 use std::path::PathBuf;
@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
         args.mount_dir.clone(),
         args.mount_type,
         args.environment_name,
+        args.download,
     )
     .await?;
 
@@ -46,6 +47,7 @@ pub struct MountArgs {
     pub mount_dir: PathBuf,
     pub mount_type: MountBackend,
     pub environment_name: String,
+    pub download: bool,
 }
 
 fn handle_input_arguments() -> anyhow::Result<MountArgs> {
@@ -76,6 +78,12 @@ fn handle_input_arguments() -> anyhow::Result<MountArgs> {
                 .long("ENVIRONMENT")
                 .default_value("default"),
         )
+        .arg(
+            Arg::new("DOWNLOAD")
+                .long("DOWNLOAD")
+                .help("Download any packages that are not already in the cache via rattler")
+                .action(ArgAction::SetTrue),
+        )
         .get_matches();
 
     let pixi_lock = matches.get_one::<PathBuf>("PIXI_LOCK").unwrap().clone();
@@ -103,6 +111,8 @@ fn handle_input_arguments() -> anyhow::Result<MountArgs> {
 
     let environment_name = matches.get_one::<String>("ENVIRONMENT").unwrap().clone();
 
+    let download = matches.get_flag("DOWNLOAD");
+
     let mount_dir = mount_dir.canonicalize().unwrap();
 
     Ok(MountArgs {
@@ -111,5 +121,6 @@ fn handle_input_arguments() -> anyhow::Result<MountArgs> {
         mount_dir,
         mount_type,
         environment_name,
+        download,
     })
 }

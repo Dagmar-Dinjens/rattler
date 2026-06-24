@@ -1,11 +1,9 @@
 use crate::metadata::{CustomPrefixPlaceholder, FSMetadata};
 use anyhow::anyhow;
-use rattler_cache::package_cache::CacheKey;
-use rattler_conda_types::{
-    Platform,
-    package::PathsJson,
-};
-use rattler_lock::{LockFile, LockedPackage};
+use rattler_cache::package_cache::{CacheKey, PackageCache};
+use rattler_conda_types::{Platform, package::PathsJson};
+use rattler_lock::{LockFile, LockedPackage, UrlOrPath};
+use rattler_networking::LazyClient;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -30,6 +28,7 @@ pub async fn mount_environment(
     mount_dir: PathBuf,
     backend: MountBackend,
     environment_name: String,
+    download_if_missing: bool,
 ) -> anyhow::Result<Box<dyn MountSession>> {
     let package_refs = solve_environment(&pixi_lock, &environment_name)?;
 
@@ -37,7 +36,12 @@ pub async fn mount_environment(
     let mut directory_indices = HashMap::new();
     directory_indices.insert(PathBuf::from("."), 0);
 
+    let package_cache = download_if_missing.then(|| PackageCache::new(&cache_origin));
+    let client = LazyClient::default();
+
     for package_ref in package_refs {
+        ensure_package_cached(&package_ref, &cache_origin, package_cache.as_ref(), &client).await?;
+
         let (paths_json, package_dir) = get_paths_json(&package_ref, &cache_origin)?;
         path_parse(
             paths_json,
@@ -49,6 +53,50 @@ pub async fn mount_environment(
     }
 
     backends::generate_mount(backend, metadata, mount_dir).await
+}
+
+async fn ensure_package_cached(
+    package_ref: &LockedPackage,
+    cache_origin: &Path,
+    package_cache: Option<&PackageCache>,
+    client: &LazyClient,
+) -> anyhow::Result<()> {
+    let package_data = package_ref
+        .as_binary_conda()
+        .ok_or_else(|| anyhow!("only binary conda packages can be mounted"))?;
+    let cache_key = CacheKey::from(&package_data.package_record);
+    let cache_path = cache_origin.join(cache_key.to_string());
+
+    if cache_path.exists() {
+        return Ok(());
+    }
+
+    let Some(cache) = package_cache else {
+        return Err(anyhow!(
+            "package '{}' is not in the cache at {}; pass --DOWNLOAD to fetch it",
+            package_ref.name(),
+            cache_origin.display()
+        ));
+    };
+
+    let url = match &package_data.location {
+        UrlOrPath::Url(u) => u.clone(),
+        UrlOrPath::Path(p) => {
+            return Err(anyhow!(
+                "package '{}' is not in the cache and its lockfile location is a local path ({}); cannot download",
+                package_ref.name(),
+                p
+            ));
+        }
+    };
+
+    println!("Downloading {} from {}", package_ref.name(), url);
+    cache
+        .get_or_fetch_from_url(cache_key, url, client.clone(), None)
+        .await
+        .map_err(|e| anyhow!("failed to download package '{}': {e}", package_ref.name()))?;
+
+    Ok(())
 }
 
 pub fn solve_environment(
@@ -152,4 +200,3 @@ pub fn path_parse(
 
     Ok(())
 }
-

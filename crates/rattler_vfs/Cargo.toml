@@ -31,4 +31,5 @@ tempfile = { workspace = true }
 rattler_conda_types = { workspace = true }
 rattler_cache = { workspace = true }
 rattler_lock = { workspace = true }
+rattler_networking = { workspace = true }
 

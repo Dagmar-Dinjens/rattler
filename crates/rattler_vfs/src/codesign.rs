@@ -30,20 +30,32 @@ impl fmt::Display for CodesignError {
             Self::OutOfBounds => write!(f, "code signature out of bounds"),
             Self::InvalidSuperBlob => write!(f, "invalid SuperBlob magic"),
             Self::NoCodeDirectory => write!(f, "CodeDirectory not found in SuperBlob"),
-            Self::UnsupportedHashType(t) => write!(f, "unsupported hash type {t} (expected SHA-256)"),
+            Self::UnsupportedHashType(t) => {
+                write!(f, "unsupported hash type {t} (expected SHA-256)")
+            }
         }
     }
 }
 
 fn read_u32_be(data: &[u8], offset: usize) -> u32 {
-    u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+    u32::from_be_bytes([
+        data[offset],
+        data[offset + 1],
+        data[offset + 2],
+        data[offset + 3],
+    ])
 }
 
 fn read_u32(data: &[u8], offset: usize, big_endian: bool) -> u32 {
     if big_endian {
         read_u32_be(data, offset)
     } else {
-        u32::from_le_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]])
+        u32::from_le_bytes([
+            data[offset],
+            data[offset + 1],
+            data[offset + 2],
+            data[offset + 3],
+        ])
     }
 }
 

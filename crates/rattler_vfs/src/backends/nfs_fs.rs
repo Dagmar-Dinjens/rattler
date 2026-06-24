@@ -132,11 +132,7 @@ impl NfsReadFileSystem for NfsFS {
 // the handler strips ACCESS3_EXECUTE, preventing execve() from the NFS mount.
 // All mutating operations return ROFS — the filesystem is effectively read-only.
 impl NfsFileSystem for NfsFS {
-    async fn setattr(
-        &self,
-        _id: &FileHandleU64,
-        _setattr: sattr3,
-    ) -> Result<fattr3, nfsstat3> {
+    async fn setattr(&self, _id: &FileHandleU64, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
         Err(nfsstat3::NFS3ERR_ROFS)
     }
 
