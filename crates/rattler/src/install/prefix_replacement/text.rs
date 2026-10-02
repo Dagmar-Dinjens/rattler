@@ -12,8 +12,8 @@ use rattler_conda_types::package::{
 use regex::Regex;
 
 use super::{
-    EncodedPrefix, InconsistentOffsetsError, OffsetReplaceError, TextPatch, encoded_prefix_for,
-    write_replacement_range,
+    EncodedPrefix, InconsistentOffsetsError, OffsetReplaceError, TextOccurrence, TextPatch,
+    encoded_prefix_for, write_replacement_range,
 };
 
 static SHEBANG_REGEX: Lazy<Regex> = Lazy::new(|| {
@@ -157,6 +157,29 @@ pub fn copy_and_replace_textual_placeholder(
 
     let patches = find_text_patches(source_bytes, region_end, &prefixes);
     write_patched_text(destination, source_bytes, region_end, &patches)
+}
+
+/// Finds the placeholder occurrences that search-based text replacement replaces, starting at or
+/// after `from`, under every encoding the draft CEP defines and ordered by position in the file.
+///
+/// This exposes the search [`copy_and_replace_textual_placeholder`] performs, including how it
+/// resolves overlapping matches of different encodings, so that callers patching files lazily,
+/// such as the mount-time ranged reads in `rattler_vfs`, stay byte-identical with it. Pass the
+/// end of the shebang region as `from` on targets that rewrite shebangs, as the installer does.
+pub fn find_text_occurrences(
+    source_bytes: &[u8],
+    from: usize,
+    prefix_placeholder: &str,
+) -> Vec<TextOccurrence> {
+    // Only the placeholder is searched for, so the target prefix does not matter here.
+    let prefixes = EncodedPrefix::all(prefix_placeholder, "");
+    find_text_patches(source_bytes, from, &prefixes)
+        .into_iter()
+        .map(|patch| TextOccurrence {
+            offset: patch.offset,
+            encoding: patch.prefix.encoding,
+        })
+        .collect()
 }
 
 /// Finds every placeholder occurrence that starts at or after `from`, under every encoding,

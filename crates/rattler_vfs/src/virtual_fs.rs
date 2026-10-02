@@ -1,11 +1,8 @@
 use libc::{EIO, ENOENT, ENOTDIR};
 use memmap2::Mmap;
-#[cfg(target_os = "macos")]
-use rattler::install::link::copy_and_replace_placeholders_with_offsets;
+use rattler::install::link::CStringOccurrences;
 use rattler_conda_types::Subdir;
-use rattler_conda_types::package::{
-    FileMode, OffsetEncoding, OffsetGroup, OffsetRanges, PathType, PrefixOffsets,
-};
+use rattler_conda_types::package::{FileMode, PathType, PrefixOffsets};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
@@ -98,9 +95,9 @@ enum ReplacementPlan {
     /// (exactly as the installer does) and the remaining occurrences are body
     /// offsets spliced on read.
     Text(crate::prefix_replacement::TextPlan),
-    /// Binary file: c-string groups, each listing prefix offsets followed by
-    /// the NUL terminator position.
-    Binary(Vec<Vec<usize>>),
+    /// Binary file: the c-strings to patch, each with its encoding, prefix
+    /// offsets and NUL terminator position.
+    Binary(Vec<CStringOccurrences>),
 }
 
 pub struct VirtualFS {
@@ -148,7 +145,6 @@ impl VirtualFS {
             };
 
             let ino = (i + 1) as u64;
-            let old_prefix = placeholder.placeholder.as_bytes();
 
             // Resolve the on-disk cache path, preferring cache_prefix_path
             // (set for noarch Python files where virtual path differs from cache path).
@@ -165,13 +161,13 @@ impl VirtualFS {
             // recorded in paths.json — that metadata exists precisely so
             // consumers don't have to scan file contents. Per the CEP, rattler
             // applies exactly the groups its own search-based replacement
-            // covers (UTF-8 only): `Some(selection)` below is usable metadata
-            // (`selection = None` meaning there are validly no UTF-8
-            // occurrences to splice), while `None` sends the file down the
-            // scanning fallback — the field is absent (pre-CEP package) or
-            // structurally invalid/unrecognized. The selected ranges are then
-            // trusted as-is (the ranged reads are total, so a non-conformant
-            // producer yields wrong bytes for its own package, never a panic).
+            // covers, which is every encoding the CEP defines, so every
+            // recorded group is spliced. `None` sends the file down the
+            // scanning fallback — the field is absent (pre-CEP package),
+            // structurally invalid, or recorded for another file mode. The
+            // recorded offsets are then trusted as-is (the ranged reads are
+            // total, so a non-conformant producer yields wrong bytes for its
+            // own package, never a panic).
             let recorded_offsets = match &placeholder.experimental_offsets {
                 None => None,
                 Some(Ok(offsets)) if offsets.file_mode() == placeholder.file_mode => Some(offsets),
@@ -193,26 +189,6 @@ impl VirtualFS {
                     None
                 }
             };
-            // The ranged reads splice UTF-8 occurrences only; wide-encoded
-            // groups are not replaced by the mount.
-            if let Some(offsets) = recorded_offsets
-                && offsets
-                    .groups()
-                    .iter()
-                    .any(|group| group.encoding() != OffsetEncoding::Utf8)
-            {
-                tracing::warn!(
-                    "{}: offsets recorded under non-UTF-8 encodings are not replaced by the mount",
-                    cache_path.display()
-                );
-            }
-            let recorded_ranges: Option<Option<&OffsetRanges>> = recorded_offsets.map(|offsets| {
-                offsets
-                    .groups()
-                    .iter()
-                    .find(|group| group.encoding() == OffsetEncoding::Utf8)
-                    .map(OffsetGroup::ranges)
-            });
             let shebang_length = recorded_offsets.and_then(PrefixOffsets::shebang_length);
 
             let plan = match placeholder.file_mode {
@@ -220,13 +196,7 @@ impl VirtualFS {
                     // With recorded offsets, construction reads at most the
                     // shebang region (`shebang_length` bytes) — the one part
                     // of the transformation a bare offset list can't express.
-                    let recorded_plan = if let Some(selection) = recorded_ranges {
-                        let body_offsets = match selection {
-                            Some(OffsetRanges::Text(offsets)) => offsets.clone(),
-                            // Validated by the selection: no UTF-8 occurrences
-                            // are recorded outside the shebang region.
-                            _ => Vec::new(),
-                        };
+                    let recorded_plan = if let Some(offsets) = recorded_offsets {
                         let region = match shebang_length {
                             Some(len) if len > 0 => match read_leading_bytes(&cache_path, len) {
                                 Ok(region) => region,
@@ -243,7 +213,7 @@ impl VirtualFS {
                         };
                         let plan = crate::prefix_replacement::TextPlan::from_recorded(
                             &region,
-                            body_offsets,
+                            offsets.groups(),
                             &placeholder.placeholder,
                             &target_prefix,
                             &platform,
@@ -295,27 +265,24 @@ impl VirtualFS {
 
                     // Post-replacement size: the transformed shebang region plus
                     // the unchanged body length plus the per-occurrence delta.
-                    let delta =
-                        target_prefix.len() as isize - placeholder.placeholder.len() as isize;
-                    let body_len = source_len.saturating_sub(text_plan.region_end);
-                    let new_size = (text_plan.transformed_region.len() as isize
-                        + body_len as isize
-                        + delta * text_plan.body_offsets.len() as isize)
-                        .max(0) as u64;
+                    let new_size = text_plan.output_len(source_len) as u64;
                     metadata[i].as_file_mut().unwrap().computed_size = Some(new_size);
 
                     ReplacementPlan::Text(text_plan)
                 }
                 FileMode::Binary => {
-                    let groups = match recorded_ranges {
-                        Some(Some(OffsetRanges::Binary(g))) => g.clone(),
-                        // Valid metadata with no UTF-8 group: nothing to
-                        // splice, and empty groups make the ranged reads serve
-                        // the bytes verbatim.
-                        Some(None) => Vec::new(),
-                        _ => match fs::read(&cache_path) {
-                            Ok(source) => crate::prefix_replacement::collect_binary_offsets(
-                                &source, old_prefix,
+                    let cstrings = if platform.is_windows() {
+                        // Like the installer, leave binaries untouched on
+                        // Windows: DLLs have no rpath to patch. No c-strings
+                        // make the ranged reads serve the bytes verbatim.
+                        Vec::new()
+                    } else if let Some(offsets) = recorded_offsets {
+                        crate::prefix_replacement::cstrings_from_recorded(offsets.groups())
+                    } else {
+                        match fs::read(&cache_path) {
+                            Ok(source) => crate::prefix_replacement::plan_binary_replacement(
+                                &source,
+                                &placeholder.placeholder,
                             ),
                             Err(e) => {
                                 tracing::warn!(
@@ -325,9 +292,9 @@ impl VirtualFS {
                                 );
                                 continue;
                             }
-                        },
+                        }
                     };
-                    ReplacementPlan::Binary(groups)
+                    ReplacementPlan::Binary(cstrings)
                 }
             };
 
@@ -525,9 +492,11 @@ impl VirtualFS {
             EIO
         })?;
 
-        let old_prefix = placeholder.placeholder.as_bytes();
-        let new_prefix_str = self.mount_point.to_string_lossy();
-        let new_prefix = new_prefix_str.as_bytes();
+        let target_prefix = self.mount_point.to_string_lossy();
+        let prefixes = crate::prefix_replacement::EncodedPrefixes::new(
+            &placeholder.placeholder,
+            &target_prefix,
+        );
 
         let start = offset as usize;
         let end = start + size as usize;
@@ -540,7 +509,7 @@ impl VirtualFS {
         };
 
         match plan {
-            ReplacementPlan::Binary(groups) => {
+            ReplacementPlan::Binary(cstrings) => {
                 // macOS binaries need codesign after prefix replacement.
                 // Codesign rehashes every page so it can't be done as a ranged
                 // operation. Materialize + resign once, cache for subsequent reads.
@@ -550,7 +519,7 @@ impl VirtualFS {
                 // original signature stays valid, so the codesign path is
                 // skipped too.
                 #[cfg(target_os = "macos")]
-                if self.platform.is_osx() && !groups.is_empty() {
+                if self.platform.is_osx() && !cstrings.is_empty() {
                     // Fast path: serve from cache
                     if let Some(cached) = self.codesign_cache.lock().unwrap().get(&ino) {
                         let s = start.min(cached.len());
@@ -558,40 +527,16 @@ impl VirtualFS {
                         return Ok(cached[s..e].to_vec());
                     }
 
-                    // Slow path: materialize, resign, cache. The plan already
-                    // holds the selected (or scanned) UTF-8 c-string groups, so
-                    // hand the dispatcher a synthesized UTF-8 offset group.
-                    let target_prefix = self.mount_point.to_string_lossy();
-                    let mut output = Vec::with_capacity(mmap.len());
-                    let result = OffsetGroup::new(
-                        OffsetEncoding::Utf8,
-                        OffsetRanges::Binary(groups.clone()),
-                    )
-                    .and_then(|group| PrefixOffsets::new(FileMode::Binary, vec![group], None))
-                    .map_err(|e| e.to_string())
-                    .and_then(|offsets| {
-                        copy_and_replace_placeholders_with_offsets(
-                            &mmap,
-                            &mut output,
-                            &placeholder.placeholder,
-                            &target_prefix,
-                            &self.platform,
-                            placeholder.file_mode,
-                            &offsets,
-                        )
-                        .map_err(|e| e.to_string())
-                    });
-
-                    if let Err(e) = result {
-                        tracing::warn!(
-                            "prefix replacement failed for {} ({}); serving raw bytes",
-                            path.display(),
-                            e
-                        );
-                        let s = start.min(mmap.len());
-                        let e = (s + size as usize).min(mmap.len());
-                        return Ok(mmap[s..e].to_vec());
-                    }
+                    // Slow path: materialize, resign, cache. The whole-file
+                    // ranged read applies the same plan as every other read,
+                    // in every encoding the plan holds.
+                    let mut output = crate::prefix_replacement::binary_ranged_read(
+                        &mmap,
+                        &prefixes,
+                        cstrings,
+                        0,
+                        mmap.len(),
+                    );
 
                     if let Err(e) = crate::codesign::adhoc_resign(&mut output) {
                         tracing::warn!("ad-hoc re-signing failed for {}: {}", path.display(), e);
@@ -605,18 +550,11 @@ impl VirtualFS {
                 }
 
                 Ok(crate::prefix_replacement::binary_ranged_read(
-                    &mmap, old_prefix, new_prefix, groups, start, end,
+                    &mmap, &prefixes, cstrings, start, end,
                 ))
             }
             ReplacementPlan::Text(text_plan) => Ok(crate::prefix_replacement::text_ranged_read(
-                &mmap,
-                old_prefix,
-                new_prefix,
-                &text_plan.body_offsets,
-                text_plan.region_end,
-                &text_plan.transformed_region,
-                start,
-                end,
+                &mmap, &prefixes, text_plan, start, end,
             )),
         }
     }

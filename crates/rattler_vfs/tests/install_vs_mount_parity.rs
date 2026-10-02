@@ -14,9 +14,13 @@
 
 use std::io::Cursor;
 
-use rattler_conda_types::{Subdir, package::FileMode};
+use rattler_conda_types::{
+    Subdir,
+    package::{FileMode, OffsetEncoding},
+};
 use rattler_vfs::prefix_replacement::{
-    binary_ranged_read, collect_binary_offsets, plan_text_replacement, text_ranged_read,
+    EncodedPrefixes, binary_ranged_read, plan_binary_replacement, plan_text_replacement,
+    text_ranged_read,
 };
 
 /// Run install-time prefix replacement and return the resulting bytes.
@@ -40,6 +44,30 @@ fn install_replace(
     output.into_inner()
 }
 
+/// Run mount-time ranged-read replacement over `[start, end)` of the output,
+/// mirroring what the VFS serves for that read.
+fn mount_replace_range(
+    source: &[u8],
+    placeholder: &str,
+    target: &str,
+    file_mode: FileMode,
+    platform: Subdir,
+    start: usize,
+    end: usize,
+) -> Vec<u8> {
+    let prefixes = EncodedPrefixes::new(placeholder, target);
+    match file_mode {
+        FileMode::Text => {
+            let plan = plan_text_replacement(source, placeholder, target, &platform);
+            text_ranged_read(source, &prefixes, &plan, start, end)
+        }
+        FileMode::Binary => {
+            let cstrings = plan_binary_replacement(source, placeholder);
+            binary_ranged_read(source, &prefixes, &cstrings, start, end)
+        }
+    }
+}
+
 /// Run mount-time ranged-read replacement over the full output range, mirroring
 /// what the VFS serves for a whole-file read.
 fn mount_replace_full(
@@ -49,35 +77,15 @@ fn mount_replace_full(
     file_mode: FileMode,
     platform: Subdir,
 ) -> Vec<u8> {
-    let placeholder_bytes = placeholder.as_bytes();
-    let target_bytes = target.as_bytes();
-    match file_mode {
-        FileMode::Text => {
-            let plan = plan_text_replacement(source, placeholder, target, &platform);
-            let huge = source.len() + target.len() * (plan.body_offsets.len() + 1) + 1024;
-            text_ranged_read(
-                source,
-                placeholder_bytes,
-                target_bytes,
-                &plan.body_offsets,
-                plan.region_end,
-                &plan.transformed_region,
-                0,
-                huge,
-            )
-        }
-        FileMode::Binary => {
-            let groups = collect_binary_offsets(source, placeholder_bytes);
-            binary_ranged_read(
-                source,
-                placeholder_bytes,
-                target_bytes,
-                &groups,
-                0,
-                source.len(),
-            )
-        }
-    }
+    mount_replace_range(
+        source,
+        placeholder,
+        target,
+        file_mode,
+        platform,
+        0,
+        usize::MAX,
+    )
 }
 
 /// Assert install-time and mount-time full replacement agree byte-for-byte.
@@ -108,32 +116,8 @@ fn assert_ranged_parity(
 ) {
     let install = install_replace(source, placeholder, target, file_mode, platform);
     for &(start, end) in ranges {
-        let mount_slice = match file_mode {
-            FileMode::Text => {
-                let plan = plan_text_replacement(source, placeholder, target, &platform);
-                text_ranged_read(
-                    source,
-                    placeholder.as_bytes(),
-                    target.as_bytes(),
-                    &plan.body_offsets,
-                    plan.region_end,
-                    &plan.transformed_region,
-                    start,
-                    end,
-                )
-            }
-            FileMode::Binary => {
-                let groups = collect_binary_offsets(source, placeholder.as_bytes());
-                binary_ranged_read(
-                    source,
-                    placeholder.as_bytes(),
-                    target.as_bytes(),
-                    &groups,
-                    start,
-                    end,
-                )
-            }
-        };
+        let mount_slice =
+            mount_replace_range(source, placeholder, target, file_mode, platform, start, end);
         let expected = &install[start.min(install.len())..end.min(install.len())];
         assert_eq!(
             mount_slice, expected,
@@ -400,5 +384,163 @@ fn ranged_read_binary_matches_install_slice() {
         FileMode::Binary,
         Subdir::Linux64,
         &[(0, 4), (2, 16), (0, install_len), (10, 20)],
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Wide encodings (UTF-16 / UTF-32): the installer replaces the placeholder in
+// every encoding the CEP defines; the mount must produce the same bytes.
+// ---------------------------------------------------------------------------
+
+const WIDE: [OffsetEncoding; 4] = [
+    OffsetEncoding::Utf16Le,
+    OffsetEncoding::Utf16Be,
+    OffsetEncoding::Utf32Le,
+    OffsetEncoding::Utf32Be,
+];
+
+/// Every window of a few sizes, so seeking is exercised at every position.
+fn all_windows(len: usize) -> Vec<(usize, usize)> {
+    (0..len)
+        .flat_map(|start| [1usize, 2, 5, 16].map(|n| (start, start + n)))
+        .chain([(0, len), (0, usize::MAX)])
+        .collect()
+}
+
+#[test]
+fn text_mode_wide_encoded_file_matches_install() {
+    let placeholder = "/old/conda/prefix";
+    for encoding in WIDE {
+        let source = encoding.encode(&format!("path={placeholder}/lib\nhome={placeholder}\n"));
+        for target in ["/new/longer/conda/prefix", "/p"] {
+            assert_full_parity(
+                &source,
+                placeholder,
+                target,
+                FileMode::Text,
+                Subdir::Linux64,
+            );
+            assert_ranged_parity(
+                &source,
+                placeholder,
+                target,
+                FileMode::Text,
+                Subdir::Linux64,
+                &all_windows(source.len() + 64),
+            );
+        }
+    }
+}
+
+#[test]
+fn text_mode_mixed_encodings_match_install() {
+    // A UTF-8 script carrying a UTF-16-LE resource string and a UTF-32-BE one,
+    // under a shebang so the region handling is mixed in too.
+    let placeholder = "/opt/old";
+    let mut source = format!("#!{placeholder}/bin/python\nx = '{placeholder}'\n").into_bytes();
+    source.resize(source.len().next_multiple_of(4), b' ');
+    source.extend(OffsetEncoding::Utf16Le.encode(&format!("{placeholder}/share")));
+    source.extend(OffsetEncoding::Utf32Be.encode(&format!("{placeholder}/etc")));
+    source.extend_from_slice(format!("\ny = '{placeholder}'\n").as_bytes());
+
+    for platform in [Subdir::Linux64, Subdir::Win64] {
+        assert_full_parity(
+            &source,
+            placeholder,
+            "/opt/new/dir",
+            FileMode::Text,
+            platform,
+        );
+        assert_ranged_parity(
+            &source,
+            placeholder,
+            "/opt/new/dir",
+            FileMode::Text,
+            platform,
+            &all_windows(source.len() + 64),
+        );
+    }
+}
+
+#[test]
+fn text_mode_overlapping_wide_matches_match_install() {
+    // In UTF-16-LE text an ASCII placeholder preceded by a zero byte also
+    // matches as UTF-16-BE one byte earlier; the installer keeps the aligned
+    // match, and so must the mount.
+    let placeholder = "/pfx";
+    let mut source = vec![b'a', 0];
+    source.extend(OffsetEncoding::Utf16Le.encode(&format!("{placeholder}/x {placeholder}")));
+    assert_full_parity(
+        &source,
+        placeholder,
+        "/new",
+        FileMode::Text,
+        Subdir::Linux64,
+    );
+    assert_ranged_parity(
+        &source,
+        placeholder,
+        "/new",
+        FileMode::Text,
+        Subdir::Linux64,
+        &all_windows(source.len() + 8),
+    );
+}
+
+#[test]
+fn binary_mode_wide_cstrings_match_install() {
+    let placeholder = "/long/old/prefix";
+    for encoding in WIDE {
+        let unit = encoding.code_unit_size();
+        let mut source = b"\x7fELF header".to_vec();
+        // Compilers emit wide strings code-unit aligned.
+        source.resize(source.len().next_multiple_of(unit), 0);
+        source.extend(encoding.encode(&format!("{placeholder}/lib:{placeholder}/bin")));
+        source.extend(vec![0; unit]);
+        source.extend_from_slice(b"\x01\x02tail\x00");
+        assert_full_parity(
+            &source,
+            placeholder,
+            "/short",
+            FileMode::Binary,
+            Subdir::Linux64,
+        );
+        assert_ranged_parity(
+            &source,
+            placeholder,
+            "/short",
+            FileMode::Binary,
+            Subdir::Linux64,
+            &all_windows(source.len()),
+        );
+    }
+}
+
+#[test]
+fn binary_mode_mixed_encodings_match_install() {
+    let placeholder = "/long/old/prefix";
+    let mut source = Vec::new();
+    source.extend_from_slice(format!("{placeholder}/a\0").as_bytes());
+    source.resize(source.len().next_multiple_of(2), 0);
+    source.extend(OffsetEncoding::Utf16Le.encode(&format!("{placeholder}/b")));
+    source.extend([0, 0]);
+    source.resize(source.len().next_multiple_of(4), 0);
+    source.extend(OffsetEncoding::Utf32Le.encode(&format!("{placeholder}/c")));
+    source.extend([0, 0, 0, 0]);
+    source.extend_from_slice(b"unrelated\0");
+    assert_full_parity(
+        &source,
+        placeholder,
+        "/p",
+        FileMode::Binary,
+        Subdir::Linux64,
+    );
+    assert_ranged_parity(
+        &source,
+        placeholder,
+        "/p",
+        FileMode::Binary,
+        Subdir::Linux64,
+        &all_windows(source.len()),
     );
 }
