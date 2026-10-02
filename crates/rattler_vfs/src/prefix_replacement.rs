@@ -6,7 +6,7 @@
 
 use memchr::memmem;
 use rattler::install::link::replace_shebang_region;
-use rattler_conda_types::Platform;
+use rattler_conda_types::Subdir;
 
 /// A precomputed, CEP-conformant text replacement plan for a single file.
 ///
@@ -39,7 +39,7 @@ pub fn plan_text_replacement(
     source: &[u8],
     placeholder: &str,
     target: &str,
-    platform: &Platform,
+    platform: &Subdir,
 ) -> TextPlan {
     let region_end = if source.starts_with(b"#!") {
         source
@@ -87,7 +87,7 @@ impl TextPlan {
         body_offsets: Vec<usize>,
         placeholder: &str,
         target: &str,
-        platform: &Platform,
+        platform: &Subdir,
     ) -> Option<TextPlan> {
         let transformed_region = if region.is_empty() {
             Vec::new()
@@ -743,11 +743,11 @@ mod tests {
 
     // ── Shebang-aware text plans ─────────────────────────────────────
 
-    use rattler_conda_types::Platform;
+    use rattler_conda_types::Subdir;
 
     #[test]
     fn plan_no_shebang() {
-        let plan = plan_text_replacement(b"hello /PFX world", "/PFX", "/new", &Platform::Linux64);
+        let plan = plan_text_replacement(b"hello /PFX world", "/PFX", "/new", &Subdir::Linux64);
         assert_eq!(plan.region_end, 0);
         assert!(plan.transformed_region.is_empty());
         assert_eq!(plan.body_offsets, vec![6]);
@@ -758,7 +758,7 @@ mod tests {
         // "#!/PFX/python\n" is 14 bytes; the region occurrence at offset 2 is
         // excluded, the body occurrence is kept, and the region is rewritten.
         let src = b"#!/PFX/python\nimport x  # /PFX/lib\n";
-        let plan = plan_text_replacement(src, "/PFX", "/new", &Platform::Linux64);
+        let plan = plan_text_replacement(src, "/PFX", "/new", &Subdir::Linux64);
         assert_eq!(plan.region_end, 14);
         assert_eq!(plan.body_offsets, vec![26]);
         assert_eq!(plan.transformed_region, b"#!/new/python\n");
@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn shebang_full_read_matches() {
         let src = b"#!/PFX/python\nimport x  # /PFX/lib\n";
-        let plan = plan_text_replacement(src, "/PFX", "/new", &Platform::Linux64);
+        let plan = plan_text_replacement(src, "/PFX", "/new", &Subdir::Linux64);
         let out = text_ranged_read(
             src,
             b"/PFX",
@@ -785,7 +785,7 @@ mod tests {
     fn shebang_ranged_reads_cross_region_boundary() {
         let src = b"#!/PFX/python\nimport x  # /PFX/lib\n";
         let full: &[u8] = b"#!/new/python\nimport x  # /new/lib\n";
-        let plan = plan_text_replacement(src, "/PFX", "/new", &Platform::Linux64);
+        let plan = plan_text_replacement(src, "/PFX", "/new", &Subdir::Linux64);
         for (s, e) in [(0usize, 5), (10, 20), (13, 15), (0, full.len()), (30, 100)] {
             let out = text_ranged_read(
                 src,
@@ -806,7 +806,7 @@ mod tests {
     fn plan_shebang_no_trailing_newline() {
         // Whole file is the shebang line; region covers everything, no body.
         let src = b"#!/PFX/python";
-        let plan = plan_text_replacement(src, "/PFX", "/new", &Platform::Linux64);
+        let plan = plan_text_replacement(src, "/PFX", "/new", &Subdir::Linux64);
         assert_eq!(plan.region_end, src.len());
         assert!(plan.body_offsets.is_empty());
         assert_eq!(plan.transformed_region, b"#!/new/python");
@@ -817,13 +817,13 @@ mod tests {
     #[test]
     fn from_recorded_matches_scan() {
         let src = b"#!/PFX/python\nimport x  # /PFX/lib\n";
-        let scanned = plan_text_replacement(src, "/PFX", "/new", &Platform::Linux64);
+        let scanned = plan_text_replacement(src, "/PFX", "/new", &Subdir::Linux64);
         let recorded = TextPlan::from_recorded(
             &src[..scanned.region_end],
             scanned.body_offsets.clone(),
             "/PFX",
             "/new",
-            &Platform::Linux64,
+            &Subdir::Linux64,
         )
         .unwrap();
         assert_eq!(recorded, scanned);
@@ -831,8 +831,7 @@ mod tests {
 
     #[test]
     fn from_recorded_no_shebang() {
-        let plan =
-            TextPlan::from_recorded(b"", vec![6], "/PFX", "/new", &Platform::Linux64).unwrap();
+        let plan = TextPlan::from_recorded(b"", vec![6], "/PFX", "/new", &Subdir::Linux64).unwrap();
         assert_eq!(plan.region_end, 0);
         assert!(plan.transformed_region.is_empty());
         assert_eq!(plan.body_offsets, vec![6]);
@@ -843,14 +842,8 @@ mod tests {
         // Recorded shebang_length but the file doesn't start with `#!`:
         // the caller must fall back to scanning.
         assert!(
-            TextPlan::from_recorded(
-                b"not a shebang\n",
-                vec![],
-                "/PFX",
-                "/new",
-                &Platform::Linux64
-            )
-            .is_none()
+            TextPlan::from_recorded(b"not a shebang\n", vec![], "/PFX", "/new", &Subdir::Linux64)
+                .is_none()
         );
     }
 

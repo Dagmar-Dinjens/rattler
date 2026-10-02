@@ -2,10 +2,10 @@ use libc::{EIO, ENOENT, ENOTDIR};
 use memmap2::Mmap;
 #[cfg(target_os = "macos")]
 use rattler::install::link::copy_and_replace_placeholders_with_offsets;
-use rattler_conda_types::Platform;
-use rattler_conda_types::package::{FileMode, OffsetRanges, PathType, select_utf8_offset_ranges};
-#[cfg(target_os = "macos")]
-use rattler_conda_types::package::{OffsetEncoding, OffsetGroup};
+use rattler_conda_types::Subdir;
+use rattler_conda_types::package::{
+    FileMode, OffsetEncoding, OffsetGroup, OffsetRanges, PathType, PrefixOffsets,
+};
 use std::{
     collections::{HashMap, VecDeque},
     ffi::{OsStr, OsString},
@@ -107,7 +107,7 @@ pub struct VirtualFS {
     metadata: Vec<MetadataNode>,
     mount_point: PathBuf,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    platform: Platform,
+    platform: Subdir,
     uid: u32,
     gid: u32,
     /// Pre-computed replacement plans for files with prefix placeholders.
@@ -126,14 +126,14 @@ impl VirtualFS {
         Self::with_platform(
             metadata,
             mount_point,
-            Platform::current().expect("host platform"),
+            Subdir::current().expect("host platform"),
         )
     }
 
     pub(crate) fn with_platform(
         mut metadata: Vec<MetadataNode>,
         mount_point: &Path,
-        platform: Platform,
+        platform: Subdir,
     ) -> Self {
         let target_prefix = mount_point.to_string_lossy();
         let mut offset_cache = HashMap::new();
@@ -172,24 +172,48 @@ impl VirtualFS {
             // structurally invalid/unrecognized. The selected ranges are then
             // trusted as-is (the ranged reads are total, so a non-conformant
             // producer yields wrong bytes for its own package, never a panic).
-            let recorded_ranges: Option<Option<&OffsetRanges>> =
-                match &placeholder.experimental_offsets {
-                    None => None,
-                    Some(groups) => match select_utf8_offset_ranges(
-                        groups,
-                        placeholder.file_mode,
-                        placeholder.experimental_shebang_length.is_some(),
-                    ) {
-                        Ok(selection) => Some(selection),
-                        Err(e) => {
-                            tracing::warn!(
-                                "{}: unusable offset metadata ({e}); falling back to scanning",
-                                cache_path.display()
-                            );
-                            None
-                        }
-                    },
-                };
+            let recorded_offsets = match &placeholder.experimental_offsets {
+                None => None,
+                Some(Ok(offsets)) if offsets.file_mode() == placeholder.file_mode => Some(offsets),
+                Some(Ok(offsets)) => {
+                    tracing::warn!(
+                        "{}: offsets recorded for file mode {:?} but the file is {:?}; \
+                         falling back to scanning",
+                        cache_path.display(),
+                        offsets.file_mode(),
+                        placeholder.file_mode
+                    );
+                    None
+                }
+                Some(Err(e)) => {
+                    tracing::warn!(
+                        "{}: unusable offset metadata ({e}); falling back to scanning",
+                        cache_path.display()
+                    );
+                    None
+                }
+            };
+            // The ranged reads splice UTF-8 occurrences only; wide-encoded
+            // groups are not replaced by the mount.
+            if let Some(offsets) = recorded_offsets
+                && offsets
+                    .groups()
+                    .iter()
+                    .any(|group| group.encoding() != OffsetEncoding::Utf8)
+            {
+                tracing::warn!(
+                    "{}: offsets recorded under non-UTF-8 encodings are not replaced by the mount",
+                    cache_path.display()
+                );
+            }
+            let recorded_ranges: Option<Option<&OffsetRanges>> = recorded_offsets.map(|offsets| {
+                offsets
+                    .groups()
+                    .iter()
+                    .find(|group| group.encoding() == OffsetEncoding::Utf8)
+                    .map(OffsetGroup::ranges)
+            });
+            let shebang_length = recorded_offsets.and_then(PrefixOffsets::shebang_length);
 
             let plan = match placeholder.file_mode {
                 FileMode::Text => {
@@ -203,7 +227,7 @@ impl VirtualFS {
                             // are recorded outside the shebang region.
                             _ => Vec::new(),
                         };
-                        let region = match placeholder.experimental_shebang_length {
+                        let region = match shebang_length {
                             Some(len) if len > 0 => match read_leading_bytes(&cache_path, len) {
                                 Ok(region) => region,
                                 Err(e) => {
@@ -539,22 +563,24 @@ impl VirtualFS {
                     // hand the dispatcher a synthesized UTF-8 offset group.
                     let target_prefix = self.mount_point.to_string_lossy();
                     let mut output = Vec::with_capacity(mmap.len());
-                    let offset_groups = [OffsetGroup {
-                        encoding: OffsetEncoding::Utf8,
-                        ranges: OffsetRanges::Binary(groups.clone()),
-                        has_unknown_members: false,
-                    }];
-
-                    let result = copy_and_replace_placeholders_with_offsets(
-                        &mmap,
-                        &mut output,
-                        &placeholder.placeholder,
-                        &target_prefix,
-                        &self.platform,
-                        placeholder.file_mode,
-                        &offset_groups,
-                        placeholder.experimental_shebang_length,
-                    );
+                    let result = OffsetGroup::new(
+                        OffsetEncoding::Utf8,
+                        OffsetRanges::Binary(groups.clone()),
+                    )
+                    .and_then(|group| PrefixOffsets::new(FileMode::Binary, vec![group], None))
+                    .map_err(|e| e.to_string())
+                    .and_then(|offsets| {
+                        copy_and_replace_placeholders_with_offsets(
+                            &mmap,
+                            &mut output,
+                            &placeholder.placeholder,
+                            &target_prefix,
+                            &self.platform,
+                            placeholder.file_mode,
+                            &offsets,
+                        )
+                        .map_err(|e| e.to_string())
+                    });
 
                     if let Err(e) = result {
                         tracing::warn!(
@@ -801,7 +827,6 @@ mod tests {
                         file_mode: FileMode::Text,
                         placeholder: "/old/prefix".to_string(),
                         experimental_offsets: None,
-                        experimental_shebang_length: None,
                     }),
                     no_link: false,
                     sha256: None,
@@ -814,7 +839,6 @@ mod tests {
                         file_mode: FileMode::Text,
                         placeholder: "/old/prefix".to_string(),
                         experimental_offsets: None,
-                        experimental_shebang_length: None,
                     }),
                     no_link: false,
                     sha256: None,
@@ -834,7 +858,7 @@ mod tests {
         );
 
         let mount_point = PathBuf::from("/new/prefix");
-        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
+        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Subdir::Linux64);
 
         (tmpdir, vfs)
     }
@@ -1177,12 +1201,9 @@ mod tests {
         );
 
         // Add a virtual entry point
-        let python_info = PythonInfo::from_version(
-            &Version::from_str("3.11.0").unwrap(),
-            None,
-            Platform::Linux64,
-        )
-        .unwrap();
+        let python_info =
+            PythonInfo::from_version(&Version::from_str("3.11.0").unwrap(), None, Subdir::Linux64)
+                .unwrap();
         let ep = rattler_conda_types::package::EntryPoint::from_str("mytool = mymod:main").unwrap();
         crate::add_entry_points(
             &[ep],
@@ -1192,7 +1213,7 @@ mod tests {
             &mut dir_indices,
         );
 
-        let vfs = VirtualFS::with_platform(env_paths, Path::new("/new/prefix"), Platform::Linux64);
+        let vfs = VirtualFS::with_platform(env_paths, Path::new("/new/prefix"), Subdir::Linux64);
         (tmpdir, vfs)
     }
 
@@ -1244,7 +1265,6 @@ mod tests {
                     file_mode: FileMode::Text,
                     placeholder: "/old/prefix".to_string(),
                     experimental_offsets: None,
-                    experimental_shebang_length: None,
                 }),
                 no_link: false,
                 sha256: None,
@@ -1253,12 +1273,9 @@ mod tests {
             paths_version: 1,
         };
 
-        let python_info = PythonInfo::from_version(
-            &Version::from_str("3.11.0").unwrap(),
-            None,
-            Platform::Linux64,
-        )
-        .unwrap();
+        let python_info =
+            PythonInfo::from_version(&Version::from_str("3.11.0").unwrap(), None, Subdir::Linux64)
+                .unwrap();
 
         let (mut env_paths, mut dir_indices) = new_empty_tree();
         path_parse(
@@ -1270,7 +1287,7 @@ mod tests {
         );
 
         let mount_point = PathBuf::from("/new/prefix");
-        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Platform::Linux64);
+        let vfs = VirtualFS::with_platform(env_paths, &mount_point, Subdir::Linux64);
 
         // The file should appear under bin/ in the virtual tree
         let bin_attr = vfs.do_lookup(1, OsStr::new("bin")).unwrap();

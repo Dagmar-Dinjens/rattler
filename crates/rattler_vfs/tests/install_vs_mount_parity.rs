@@ -14,7 +14,7 @@
 
 use std::io::Cursor;
 
-use rattler_conda_types::{Platform, package::FileMode};
+use rattler_conda_types::{Subdir, package::FileMode};
 use rattler_vfs::prefix_replacement::{
     binary_ranged_read, collect_binary_offsets, plan_text_replacement, text_ranged_read,
 };
@@ -25,7 +25,7 @@ fn install_replace(
     placeholder: &str,
     target_prefix: &str,
     file_mode: FileMode,
-    platform: Platform,
+    platform: Subdir,
 ) -> Vec<u8> {
     let mut output = Cursor::new(Vec::<u8>::new());
     rattler::install::link::copy_and_replace_placeholders(
@@ -47,7 +47,7 @@ fn mount_replace_full(
     placeholder: &str,
     target: &str,
     file_mode: FileMode,
-    platform: Platform,
+    platform: Subdir,
 ) -> Vec<u8> {
     let placeholder_bytes = placeholder.as_bytes();
     let target_bytes = target.as_bytes();
@@ -86,7 +86,7 @@ fn assert_full_parity(
     placeholder: &str,
     target: &str,
     file_mode: FileMode,
-    platform: Platform,
+    platform: Subdir,
 ) {
     let install = install_replace(source, placeholder, target, file_mode, platform);
     let mount = mount_replace_full(source, placeholder, target, file_mode, platform);
@@ -103,7 +103,7 @@ fn assert_ranged_parity(
     placeholder: &str,
     target: &str,
     file_mode: FileMode,
-    platform: Platform,
+    platform: Subdir,
     ranges: &[(usize, usize)],
 ) {
     let install = install_replace(source, placeholder, target, file_mode, platform);
@@ -156,7 +156,7 @@ fn text_mode_simple_replacement_matches_install() {
         placeholder,
         target,
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -168,7 +168,7 @@ fn text_mode_multiple_replacements_match_install() {
         "/p",
         "/QQQQ",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -179,7 +179,7 @@ fn text_mode_no_replacement_match_install() {
         "/old/conda/prefix",
         "/new/conda/prefix",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -192,7 +192,7 @@ fn text_mode_shorter_target_matches_install() {
         placeholder,
         "/short",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -207,19 +207,13 @@ fn shebang_kept_short_prefix_matches_install() {
     let target = "/opt/new";
     let source = format!("#!{placeholder}/bin/python\nimport os  # {placeholder}/lib\n");
     let bytes = source.into_bytes();
-    assert_full_parity(
-        &bytes,
-        placeholder,
-        target,
-        FileMode::Text,
-        Platform::Linux64,
-    );
+    assert_full_parity(&bytes, placeholder, target, FileMode::Text, Subdir::Linux64);
     assert_ranged_parity(
         &bytes,
         placeholder,
         target,
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
         &[(0, 3), (2, 25), (10, 40), (0, 4096), (35, 4096)],
     );
 }
@@ -240,7 +234,7 @@ fn shebang_collapses_long_prefix_matches_install() {
         placeholder,
         &target,
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -253,7 +247,7 @@ fn shebang_no_trailing_newline_matches_install() {
         placeholder,
         "/opt/new",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -266,7 +260,7 @@ fn shebang_multiple_occurrences_in_line_matches_install() {
         placeholder,
         "/opt/new",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -279,7 +273,7 @@ fn shebang_only_occurrence_in_line_matches_install() {
         placeholder,
         "/opt/new",
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -292,13 +286,13 @@ fn shebang_non_rewriting_target_matches_install() {
     let target = "/opt/new";
     let source = format!("#!{placeholder}/bin/python\nimport os  # {placeholder}/lib\n");
     let bytes = source.into_bytes();
-    assert_full_parity(&bytes, placeholder, target, FileMode::Text, Platform::Win64);
+    assert_full_parity(&bytes, placeholder, target, FileMode::Text, Subdir::Win64);
     assert_ranged_parity(
         &bytes,
         placeholder,
         target,
         FileMode::Text,
-        Platform::Win64,
+        Subdir::Win64,
         &[(0, 5), (2, 30), (0, 4096)],
     );
 }
@@ -327,7 +321,7 @@ fn binary_mode_cstring_with_padding_matches_install() {
         "/long/old/prefix",
         "/short",
         FileMode::Binary,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -338,7 +332,7 @@ fn binary_mode_no_replacement_matches_install() {
         "/long/old/prefix",
         "/short",
         FileMode::Binary,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -356,7 +350,7 @@ fn binary_mode_multiple_cstrings_match_install() {
         placeholder,
         "/p",
         FileMode::Binary,
-        Platform::Linux64,
+        Subdir::Linux64,
     );
 }
 
@@ -375,7 +369,7 @@ fn ranged_read_text_matches_install_slice() {
         placeholder,
         target,
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
     )
     .len();
     assert_ranged_parity(
@@ -383,7 +377,7 @@ fn ranged_read_text_matches_install_slice() {
         placeholder,
         target,
         FileMode::Text,
-        Platform::Linux64,
+        Subdir::Linux64,
         &[(0, 5), (3, 20), (7, install_len), (0, 1)],
     );
 }
@@ -396,7 +390,7 @@ fn ranged_read_binary_matches_install_slice() {
         "/long/old/prefix",
         "/p",
         FileMode::Binary,
-        Platform::Linux64,
+        Subdir::Linux64,
     )
     .len();
     assert_ranged_parity(
@@ -404,7 +398,7 @@ fn ranged_read_binary_matches_install_slice() {
         "/long/old/prefix",
         "/p",
         FileMode::Binary,
-        Platform::Linux64,
+        Subdir::Linux64,
         &[(0, 4), (2, 16), (0, install_len), (10, 20)],
     );
 }
