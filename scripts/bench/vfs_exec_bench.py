@@ -224,7 +224,12 @@ def main() -> int:
                 label = f"{wname:<15} {tname:<12} {scenario:<6}"
                 try:
                     # Prime caches (repodata always; packages for warm/fresh;
-                    # the environment itself for warm).
+                    # the environment itself for warm). Fresh/cold start the
+                    # priming run from a clean env dir as well, so a leftover
+                    # (e.g. a stopped ProjFS root from a failed warm run)
+                    # cannot poison them.
+                    if scenario in ("fresh", "cold"):
+                        drop_envs()
                     run_once(argv, env, args.timeout)
                     samples = []
                     for _ in range(n):
