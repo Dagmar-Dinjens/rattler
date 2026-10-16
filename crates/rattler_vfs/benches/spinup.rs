@@ -20,6 +20,7 @@ mod common;
 use std::{
     path::{Path, PathBuf},
     process::Command,
+    sync::OnceLock,
     time::Duration,
 };
 
@@ -41,6 +42,24 @@ fn run_python(prefix: &Path, code: &str) {
     );
 }
 
+/// An empty directory at a stable path, recreated per iteration.
+///
+/// `rattler exec` / `pixi exec` always rebuild an environment at the same
+/// path, and on macOS the kernel's code-signature cache is keyed on it, so a
+/// fresh random path per iteration would overstate first-run costs.
+fn slot(name: &str) -> PathBuf {
+    static BASE: OnceLock<TempDir> = OnceLock::new();
+    let path = BASE
+        .get_or_init(|| tempfile::tempdir().expect("tempdir"))
+        .path()
+        .join(name);
+    if path.exists() {
+        std::fs::remove_dir_all(&path).expect("clear previous iteration");
+    }
+    std::fs::create_dir_all(&path).expect("create slot");
+    path
+}
+
 fn install(prefix: &Path) {
     let fixture = common::fixture();
     common::runtime()
@@ -53,16 +72,10 @@ fn install(prefix: &Path) {
         .expect("install environment");
 }
 
+/// A live mount; dropping it unmounts.
 struct Mounted {
-    // Field order matters: unmount before the mount point directory goes.
     handle: Option<MountHandle>,
-    dir: TempDir,
-}
-
-impl Mounted {
-    fn prefix(&self) -> PathBuf {
-        self.dir.path().to_path_buf()
-    }
+    prefix: PathBuf,
 }
 
 impl Drop for Mounted {
@@ -73,23 +86,22 @@ impl Drop for Mounted {
     }
 }
 
-fn mount() -> Mounted {
+fn mount(prefix: PathBuf) -> Mounted {
     let fixture = common::fixture();
-    let dir = tempfile::tempdir().expect("tempdir");
     let handle = common::runtime()
         .block_on(build_and_mount(
             &fixture.lockfile,
             &fixture.environment,
             fixture.platform,
             &fixture.package_cache,
-            &fixture.mount_config(dir.path()),
+            &fixture.mount_config(&prefix),
         ))
         .expect("mount environment");
     // A mount is only usable once the kernel answers for it.
-    std::fs::metadata(common::python_in(dir.path())).expect("python visible in mount");
+    std::fs::metadata(common::python_in(&prefix)).expect("python visible in mount");
     Mounted {
         handle: Some(handle),
-        dir,
+        prefix,
     }
 }
 
@@ -101,39 +113,47 @@ fn bench_spinup(c: &mut Criterion) {
         .sample_size(10)
         .measurement_time(Duration::from_secs(30));
 
+    // `iter_batched` returns each iteration's prefix / mount out of the timed
+    // region, so deleting the install and unmounting are not measured (except
+    // in `mounted_and_unmounted`).
     group.bench_function("installed", |b| {
         b.iter_batched(
-            || tempfile::tempdir().expect("tempdir"),
-            |dir| {
-                install(dir.path());
-                dir
-            },
+            || slot("installed"),
+            |prefix| install(&prefix),
             BatchSize::PerIteration,
         );
     });
     group.bench_function("installed_python", |b| {
         b.iter_batched(
-            || tempfile::tempdir().expect("tempdir"),
-            |dir| {
-                install(dir.path());
-                run_python(dir.path(), "pass");
-                dir
+            || slot("installed_python"),
+            |prefix| {
+                install(&prefix);
+                run_python(&prefix, "pass");
             },
             BatchSize::PerIteration,
         );
     });
     if mounts {
-        group.bench_function("mounted", |b| b.iter(mount));
-        group.bench_function("mounted_python", |b| {
-            b.iter(|| {
-                let m = mount();
-                run_python(&m.prefix(), "pass");
-                m
-            });
+        group.bench_function("mounted", |b| {
+            b.iter_batched(|| slot("mounted"), mount, BatchSize::PerIteration);
         });
-        // Full lifecycle, including the unmount the other variants leave out.
+        group.bench_function("mounted_python", |b| {
+            b.iter_batched(
+                || slot("mounted_python"),
+                |prefix| {
+                    let m = mount(prefix);
+                    run_python(&m.prefix, "pass");
+                    m
+                },
+                BatchSize::PerIteration,
+            );
+        });
         group.bench_function("mounted_and_unmounted", |b| {
-            b.iter(|| drop(mount()));
+            b.iter_batched(
+                || slot("mounted_and_unmounted"),
+                |prefix| drop(mount(prefix)),
+                BatchSize::PerIteration,
+            );
         });
     }
     group.finish();
@@ -141,13 +161,13 @@ fn bench_spinup(c: &mut Criterion) {
 
 fn bench_prefix_io(c: &mut Criterion) {
     common::fixture();
-    let installed = tempfile::tempdir().expect("tempdir");
-    install(installed.path());
-    let mounted = common::mounts_enabled().then(mount);
+    let installed = slot("io_installed");
+    install(&installed);
+    let mounted = common::mounts_enabled().then(|| mount(slot("io_mounted")));
 
-    let mut prefixes = vec![("installed", installed.path().to_path_buf())];
+    let mut prefixes = vec![("installed", installed)];
     if let Some(m) = &mounted {
-        prefixes.push(("mounted", m.prefix()));
+        prefixes.push(("mounted", m.prefix.clone()));
     }
     for (label, prefix) in &prefixes {
         let stats = common::read_tree(prefix);

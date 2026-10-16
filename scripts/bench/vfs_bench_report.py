@@ -51,6 +51,8 @@ def collect_criterion(criterion_dir: Path, out: Path) -> None:
 
 
 def fmt_time(seconds: float) -> str:
+    if seconds < 0:
+        return "-" + fmt_time(-seconds)
     if seconds >= 1:
         return f"{seconds:.2f} s"
     if seconds >= 1e-3:

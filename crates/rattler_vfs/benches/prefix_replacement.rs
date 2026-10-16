@@ -155,7 +155,7 @@ fn bench_ranged_reads(c: &mut Criterion) {
             b.iter(|| {
                 let mut total = 0;
                 for chunk in black_box(&text).chunks(WINDOW) {
-                    total += chunk.to_vec().len();
+                    total += black_box(chunk.to_vec()).len();
                 }
                 total
             });
