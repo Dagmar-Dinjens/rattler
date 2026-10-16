@@ -5801,6 +5801,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "astral-reqwest-middleware",
+ "criterion",
  "fuser",
  "hex",
  "libc",

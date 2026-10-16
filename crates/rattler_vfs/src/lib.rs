@@ -439,6 +439,26 @@ impl MetadataTree {
         )
         .await
     }
+
+    /// Number of nodes (files, directories, symlinks) in the tree.
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    /// Whether the tree has no nodes at all.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl VirtualFS {
+    /// Build the transport-agnostic [`VirtualFS`] for `tree` without mounting
+    /// it, so its [`vfs_ops::VfsOps`] can be driven in-process (benchmarks,
+    /// custom transports). This does the same eager prefix-offset computation
+    /// as [`mount`].
+    pub fn from_tree(tree: MetadataTree, mount_point: &Path) -> Self {
+        Self::new(tree.0, mount_point)
+    }
 }
 
 /// Transport backend for the virtual filesystem.
