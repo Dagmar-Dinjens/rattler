@@ -47,13 +47,11 @@ jobs:
             env "$@" RUST_LOG=${LOG:-info} $R "${CMD[@]}" 2>&1 | ts > logs/$name.log || true
             echo "$name: $(python3 -c "print(round($(date +%s.%N)-$start,1))")s" | tee -a logs/summary.txt
           }
-          run default-1 X=1
-          run default-2 X=1
-          LOG="info,rattler_cache=debug,h2=debug,hyper_util=debug,reqwest=debug" run default-h2log X=1
-          run readtimeout10 DBG_READ_TIMEOUT=10
-          run http1 DBG_HTTP1=1
-          run http1-2 DBG_HTTP1=1
-          run adaptive DBG_ADAPTIVE=1
+          echo "cores: $(nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo $NUMBER_OF_PROCESSORS)" | tee -a logs/summary.txt
+          for i in 1 2 3; do run default-$i X=1; done
+          for i in 1 2 3; do run blocking512-$i DBG_MAX_BLOCKING=512; done
+          for i in 1 2; do run blocking32-$i DBG_MAX_BLOCKING=32; done
+          for i in 1 2; do run http1-$i DBG_HTTP1=1; done
           rm -rf "$PIXI_CACHE_DIR"
           pixi exec -s python=3.12 -s numpy=2 -- python -c "import numpy" >/dev/null 2>&1
           rm -rf "$PIXI_CACHE_DIR/pkgs"

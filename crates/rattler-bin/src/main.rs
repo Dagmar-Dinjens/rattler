@@ -91,7 +91,12 @@ fn main() -> miette::Result<()> {
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(num_cores / 2)
-        .max_blocking_threads(num_cores)
+        .max_blocking_threads(
+            std::env::var("DBG_MAX_BLOCKING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(num_cores),
+        )
         .enable_all()
         .build()
         .into_diagnostic()?;
