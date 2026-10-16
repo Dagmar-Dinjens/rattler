@@ -1,0 +1,58 @@
+on:
+  workflow_dispatch:
+  push:
+    branches: [debug-exec-stall]
+
+name: exec stall repro
+
+permissions:
+  contents: read
+
+jobs:
+  repro:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          submodules: recursive
+      - uses: prefix-dev/setup-pixi@5185adfbffb4bd703da3010310260805d89ebb11 # v0.9.6
+        with:
+          run-install: false
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: vfs-bench
+      - name: Build rattler (release)
+        run: cargo build --release -p rattler-bin
+      - name: Repro
+        shell: bash
+        run: |
+          set -x
+          R=$PWD/target/release/rattler
+          export RATTLER_CACHE_DIR=$RUNNER_TEMP/rc
+          export PIXI_CACHE_DIR=$RUNNER_TEMP/pc
+          mkdir -p logs
+          # prime repodata
+          $R exec -s python=3.12 -s numpy=2 -- python -c "import numpy" > logs/prime.log 2>&1 || true
+          for i in 1 2; do
+            rm -rf "$RATTLER_CACHE_DIR/pkgs"
+            start=$(date +%s)
+            RUST_LOG=rattler=debug,rattler_package_streaming=trace,rattler_networking=trace,reqwest=debug,reqwest_retry=debug,hyper_util=debug,h2=info \
+              $R exec -s python=3.12 -s numpy=2 -- python -c "import numpy; print(numpy.__version__)" > logs/cold-$i.log 2>&1 || true
+            echo "rattler cold $i: $(( $(date +%s) - start ))s" | tee -a logs/summary.txt
+          done
+          rm -rf "$PIXI_CACHE_DIR/pkgs"
+          pixi exec -s python=3.12 -s numpy=2 -- python -c "import numpy" >/dev/null 2>&1
+          rm -rf "$PIXI_CACHE_DIR/pkgs"
+          start=$(date +%s)
+          pixi exec -vvv -s python=3.12 -s numpy=2 -- python -c "import numpy" > logs/pixi-cold.log 2>&1 || true
+          echo "pixi cold: $(( $(date +%s) - start ))s" | tee -a logs/summary.txt
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: stall-${{ matrix.os }}
+          path: logs
