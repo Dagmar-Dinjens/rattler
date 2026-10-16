@@ -49,7 +49,21 @@ fuser = { workspace = true }
 fuser = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
+rattler = { workspace = true, default-features = false, features = ["rustls"] }
 tempfile = { workspace = true }
+
+[[bench]]
+name = "prefix_replacement"
+harness = false
+
+[[bench]]
+name = "vfs_ops"
+harness = false
+
+[[bench]]
+name = "spinup"
+harness = false
 
 [features]
 default = ["nfs"]
