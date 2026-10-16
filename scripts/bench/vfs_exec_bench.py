@@ -98,7 +98,15 @@ def rmtree(path: Path) -> None:
         except OSError:
             # A just-unmounted mount point (or ProjFS root) can be briefly busy.
             time.sleep(0.5 * (attempt + 1))
-    shutil.rmtree(path, ignore_errors=True)
+    # A stopped ProjFS virtualization root cannot be deleted at all
+    # ("The provider that supports file system virtualization is temporarily
+    # unavailable", os error 369). Move it out of the way so the next run
+    # still starts from a clean environment directory.
+    graveyard = path.parent.parent / "graveyard"
+    graveyard.mkdir(parents=True, exist_ok=True)
+    target = graveyard / f"{path.name}-{time.time_ns()}"
+    print(f"note: could not delete {path}; moved it to {target}", flush=True)
+    os.replace(path, target)
 
 
 def run_once(argv: list[str], env: dict[str, str], timeout: float) -> float:
@@ -152,6 +160,9 @@ def main() -> int:
     parser.add_argument("--runs-cold", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=900)
     args = parser.parse_args()
+    # Tool errors contain box-drawing characters; don't crash on cp1252 consoles.
+    for stream in (sys.stdout, sys.stderr):
+        stream.reconfigure(errors="replace")
 
     args.out.mkdir(parents=True, exist_ok=True)
     work = args.work_dir or Path(tempfile.mkdtemp(prefix="vfs-exec-bench-"))
