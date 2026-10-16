@@ -31,26 +31,35 @@ jobs:
       - name: Repro
         shell: bash
         run: |
-          set -x
           R=$PWD/target/release/rattler
           export RATTLER_CACHE_DIR=$RUNNER_TEMP/rc
           export PIXI_CACHE_DIR=$RUNNER_TEMP/pc
           mkdir -p logs
+          ts() { python3 -u -c "import sys,time;t0=time.time()
+          for l in sys.stdin: sys.stdout.write('%7.2f %s'%(time.time()-t0,l))"; }
+          CMD=(exec -s python=3.12 -s numpy=2 -- python -c "import numpy; print(numpy.__version__)")
           # prime repodata
-          $R exec -s python=3.12 -s numpy=2 -- python -c "import numpy" > logs/prime.log 2>&1 || true
-          for i in 1 2; do
-            rm -rf "$RATTLER_CACHE_DIR/pkgs"
-            start=$(date +%s)
-            RUST_LOG=rattler=debug,rattler_package_streaming=trace,rattler_networking=trace,reqwest=debug,reqwest_retry=debug,hyper_util=debug,h2=info \
-              $R exec -s python=3.12 -s numpy=2 -- python -c "import numpy; print(numpy.__version__)" > logs/cold-$i.log 2>&1 || true
-            echo "rattler cold $i: $(( $(date +%s) - start ))s" | tee -a logs/summary.txt
-          done
-          rm -rf "$PIXI_CACHE_DIR/pkgs"
+          $R "${CMD[@]}" > logs/prime.log 2>&1 || true
+          run() {
+            name=$1; shift
+            rm -rf "$RATTLER_CACHE_DIR/pkgs" "$RATTLER_CACHE_DIR/exec"
+            start=$(date +%s.%N)
+            env "$@" RUST_LOG=${LOG:-info} $R "${CMD[@]}" 2>&1 | ts > logs/$name.log || true
+            echo "$name: $(python3 -c "print(round($(date +%s.%N)-$start,1))")s" | tee -a logs/summary.txt
+          }
+          run default-1 X=1
+          run default-2 X=1
+          LOG="info,rattler_cache=debug,h2=debug,hyper_util=debug,reqwest=debug" run default-h2log X=1
+          run readtimeout10 DBG_READ_TIMEOUT=10
+          run http1 DBG_HTTP1=1
+          run http1-2 DBG_HTTP1=1
+          run adaptive DBG_ADAPTIVE=1
+          rm -rf "$PIXI_CACHE_DIR"
           pixi exec -s python=3.12 -s numpy=2 -- python -c "import numpy" >/dev/null 2>&1
           rm -rf "$PIXI_CACHE_DIR/pkgs"
-          start=$(date +%s)
-          pixi exec -vvv -s python=3.12 -s numpy=2 -- python -c "import numpy" > logs/pixi-cold.log 2>&1 || true
-          echo "pixi cold: $(( $(date +%s) - start ))s" | tee -a logs/summary.txt
+          start=$(date +%s.%N)
+          pixi exec -vv -s python=3.12 -s numpy=2 -- python -c "import numpy" 2>&1 | ts > logs/pixi-cold.log || true
+          echo "pixi cold: $(python3 -c "print(round($(date +%s.%N)-$start,1))")s" | tee -a logs/summary.txt
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:

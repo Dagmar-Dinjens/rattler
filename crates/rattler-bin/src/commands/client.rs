@@ -44,11 +44,24 @@ pub fn repodata_cache_action(offline: bool) -> CacheAction {
 pub fn create_client_with_middleware(
     offline: bool,
 ) -> miette::Result<reqwest_middleware::ClientWithMiddleware> {
-    let download_client = Client::builder()
+    // DEBUG knobs for the exec stall investigation.
+    let read_timeout = std::env::var("DBG_READ_TIMEOUT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .map_or(READ_TIMEOUT, Duration::from_secs);
+    let mut builder = Client::builder()
         .no_gzip()
         .user_agent(USER_AGENT)
         .connect_timeout(CONNECT_TIMEOUT)
-        .read_timeout(READ_TIMEOUT)
+        .read_timeout(read_timeout);
+    if std::env::var_os("DBG_HTTP1").is_some() {
+        builder = builder.http1_only();
+    }
+    if std::env::var_os("DBG_ADAPTIVE").is_some() {
+        builder = builder.http2_adaptive_window(true);
+    }
+    eprintln!("DBG client: read_timeout={read_timeout:?} http1={} adaptive={}", std::env::var_os("DBG_HTTP1").is_some(), std::env::var_os("DBG_ADAPTIVE").is_some());
+    let download_client = builder
         .build()
         .into_diagnostic()
         .context("failed to create HTTP client")?;

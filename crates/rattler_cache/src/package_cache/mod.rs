@@ -933,12 +933,13 @@ impl PackageCache {
                     // Wait for a second to let the remote service restore itself. This increases the
                     // chance of success.
                     tracing::warn!(
-                        "failed to download and extract {} to {}: {}. Retry #{}, Sleeping {:?} until the next attempt...",
+                        "failed to download and extract {} to {}: {}. Retry #{}, Sleeping {:?} until the next attempt... DBG={:?}",
                         &url,
                         destination.display(),
                         err,
                         current_try,
-                        duration
+                        duration,
+                        err
                     );
                     tokio::time::sleep(duration).await;
                 }
