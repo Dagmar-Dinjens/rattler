@@ -85,13 +85,20 @@ jobs:
 
       - name: Criterion benchmarks (rattler_vfs)
         timeout-minutes: 90
-        run: cargo bench -p rattler_vfs --bench prefix_replacement --bench vfs_ops --bench spinup
+        shell: bash
+        run: cargo bench -p rattler_vfs --bench prefix_replacement --bench vfs_ops --bench spinup 2>&1 | tee criterion.log
+
+      - name: Keep criterion log
+        if: ${{ !cancelled() }}
+        shell: bash
+        run: mkdir -p bench-results/${{ matrix.name }} && cp criterion.log bench-results/${{ matrix.name }}/ || true
 
       - name: Collect criterion results
         if: always()
         run: python scripts/bench/vfs_bench_report.py collect-criterion target/criterion bench-results/${{ matrix.name }}/criterion-results.json
 
       - name: Exec benchmarks (pixi vs rattler vs rattler --dematerialized)
+        if: ${{ !cancelled() }}
         timeout-minutes: 90
         run: >
           python scripts/bench/vfs_exec_bench.py
