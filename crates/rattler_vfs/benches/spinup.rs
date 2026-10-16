@@ -50,12 +50,21 @@ fn run_python(prefix: &Path, code: &str) {
 /// `rattler exec` / `pixi exec` always rebuild an environment at the same
 /// path, and on macOS the kernel's code-signature cache is keyed on it, so a
 /// fresh random path per iteration would overstate first-run costs.
+///
+/// On Windows a stopped `ProjFS` virtualization root can be neither deleted
+/// nor re-read until a provider runs on it again (os error 369), so there
+/// every iteration gets its own directory instead.
 fn slot(name: &str) -> PathBuf {
     static BASE: OnceLock<TempDir> = OnceLock::new();
-    let path = BASE
-        .get_or_init(|| tempfile::tempdir().expect("tempdir"))
-        .path()
-        .join(name);
+    static COUNTER: AtomicUsize = AtomicUsize::new(0);
+    let base = BASE.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+    if cfg!(windows) {
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = base.path().join(format!("{name}-{n}"));
+        std::fs::create_dir_all(&path).expect("create slot");
+        return path;
+    }
+    let path = base.path().join(name);
     if path.exists() {
         std::fs::remove_dir_all(&path).expect("clear previous iteration");
     }
