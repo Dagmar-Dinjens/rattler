@@ -20,7 +20,10 @@ mod common;
 use std::{
     path::{Path, PathBuf},
     process::Command,
-    sync::OnceLock,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -86,17 +89,32 @@ impl Drop for Mounted {
     }
 }
 
+/// Mount attempts that failed and were retried. Rapid remounts at one path
+/// occasionally fail on macOS NFS (`mount_nfs: ... Connection refused`); that
+/// is reported rather than silently absorbed.
+static MOUNT_RETRIES: AtomicUsize = AtomicUsize::new(0);
+
 fn mount(prefix: PathBuf) -> Mounted {
     let fixture = common::fixture();
-    let handle = common::runtime()
-        .block_on(build_and_mount(
+    let mut attempt = 0;
+    let handle = loop {
+        match common::runtime().block_on(build_and_mount(
             &fixture.lockfile,
             &fixture.environment,
             fixture.platform,
             &fixture.package_cache,
             &fixture.mount_config(&prefix),
-        ))
-        .expect("mount environment");
+        )) {
+            Ok(handle) => break handle,
+            Err(err) if attempt < 3 => {
+                attempt += 1;
+                let n = MOUNT_RETRIES.fetch_add(1, Ordering::Relaxed) + 1;
+                eprintln!("mount failed (retry #{n} overall): {err:#}");
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(err) => panic!("mount environment: {err:#}"),
+        }
+    };
     // A mount is only usable once the kernel answers for it.
     std::fs::metadata(common::python_in(&prefix)).expect("python visible in mount");
     Mounted {
@@ -157,6 +175,10 @@ fn bench_spinup(c: &mut Criterion) {
         });
     }
     group.finish();
+    eprintln!(
+        "spinup: {} mount retries",
+        MOUNT_RETRIES.load(Ordering::Relaxed)
+    );
 }
 
 fn bench_prefix_io(c: &mut Criterion) {
