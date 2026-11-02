@@ -10,6 +10,8 @@ on:
       runs-cold:
         description: Runs per cold-cache exec benchmark
         default: "3"
+  # Note: GitHub checks `paths` against at most 300 changed files, so the
+  # first push of a new branch far from main may not trigger this workflow.
   push:
     branches: [vfs-benchmarks, vfs-benchmarks-exec]
     paths:
