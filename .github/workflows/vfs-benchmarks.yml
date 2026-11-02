@@ -11,7 +11,7 @@ on:
         description: Runs per cold-cache exec benchmark
         default: "3"
   push:
-    branches: [vfs-benchmarks]
+    branches: [vfs-benchmarks, vfs-benchmarks-exec]
     paths:
       - crates/rattler_vfs/**
       - crates/rattler-bin/src/commands/exec.rs

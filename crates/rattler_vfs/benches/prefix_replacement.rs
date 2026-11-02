@@ -7,9 +7,9 @@
 use std::hint::black_box;
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rattler_conda_types::Platform;
+use rattler_conda_types::Subdir;
 use rattler_vfs::prefix_replacement::{
-    binary_ranged_read, collect_binary_offsets, collect_offsets, plan_text_replacement,
+    EncodedPrefixes, binary_ranged_read, plan_binary_replacement, plan_text_replacement,
     text_ranged_read,
 };
 
@@ -76,23 +76,20 @@ fn bench_offsets(c: &mut Criterion) {
         let text = text_file(size, &placeholder);
         let binary = binary_file(size, &placeholder);
         group.throughput(Throughput::Bytes(size as u64));
-        group.bench_with_input(BenchmarkId::new("collect_offsets", label), &text, |b, t| {
-            b.iter(|| collect_offsets(black_box(t), placeholder.as_bytes()));
-        });
         group.bench_with_input(
             BenchmarkId::new("plan_text_replacement", label),
             &text,
             |b, t| {
                 b.iter(|| {
-                    plan_text_replacement(black_box(t), &placeholder, TARGET, &Platform::Linux64)
+                    plan_text_replacement(black_box(t), &placeholder, TARGET, &Subdir::Linux64)
                 });
             },
         );
         group.bench_with_input(
-            BenchmarkId::new("collect_binary_offsets", label),
+            BenchmarkId::new("plan_binary_replacement", label),
             &binary,
             |b, bin| {
-                b.iter(|| collect_binary_offsets(black_box(bin), placeholder.as_bytes()));
+                b.iter(|| plan_binary_replacement(black_box(bin), &placeholder));
             },
         );
     }
@@ -104,9 +101,10 @@ fn bench_ranged_reads(c: &mut Criterion) {
     let mut group = c.benchmark_group("prefix_replacement/read");
     for &(label, size) in SIZES {
         let text = text_file(size, &placeholder);
-        let plan = plan_text_replacement(&text, &placeholder, TARGET, &Platform::Linux64);
+        let plan = plan_text_replacement(&text, &placeholder, TARGET, &Subdir::Linux64);
         let binary = binary_file(size, &placeholder);
-        let groups = collect_binary_offsets(&binary, placeholder.as_bytes());
+        let cstrings = plan_binary_replacement(&binary, &placeholder);
+        let prefixes = EncodedPrefixes::new(&placeholder, TARGET);
         group.throughput(Throughput::Bytes(size as u64));
 
         // Whole file in WINDOW-sized reads, the way a transport serves `cat`.
@@ -115,16 +113,8 @@ fn bench_ranged_reads(c: &mut Criterion) {
                 let mut start = 0;
                 let mut total = 0;
                 loop {
-                    let chunk = text_ranged_read(
-                        black_box(&text),
-                        placeholder.as_bytes(),
-                        TARGET.as_bytes(),
-                        &plan.body_offsets,
-                        plan.region_end,
-                        &plan.transformed_region,
-                        start,
-                        start + WINDOW,
-                    );
+                    let chunk =
+                        text_ranged_read(black_box(&text), &prefixes, &plan, start, start + WINDOW);
                     if chunk.is_empty() {
                         break total;
                     }
@@ -139,9 +129,8 @@ fn bench_ranged_reads(c: &mut Criterion) {
                 while start < binary.len() {
                     let chunk = binary_ranged_read(
                         black_box(&binary),
-                        placeholder.as_bytes(),
-                        TARGET.as_bytes(),
-                        &groups,
+                        &prefixes,
+                        &cstrings,
                         start,
                         start + WINDOW,
                     );

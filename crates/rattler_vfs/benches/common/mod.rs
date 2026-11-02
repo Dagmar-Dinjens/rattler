@@ -22,14 +22,14 @@ use std::{
 };
 
 use rattler_cache::{default_cache_dir, package_cache::PackageCache};
-use rattler_conda_types::{Platform, RepoDataRecord};
+use rattler_conda_types::{RepoDataRecord, Subdir};
 use rattler_lock::LockFile;
 use rattler_vfs::{MetadataTree, Mode, MountConfig, Transport, compute_env_hash};
 
 pub struct Fixture {
     pub lockfile: LockFile,
     pub environment: String,
-    pub platform: Platform,
+    pub platform: Subdir,
     pub package_cache: PackageCache,
     pub env_hash: String,
 }
@@ -95,7 +95,7 @@ pub fn fixture() -> &'static Fixture {
         let environment =
             std::env::var("RATTLER_VFS_BENCH_ENV").unwrap_or_else(|_| "default".to_string());
         let lockfile = LockFile::from_path(&lock_path).expect("parse lock file");
-        let platform = Platform::current().expect("host platform");
+        let platform = Subdir::current().expect("host platform");
         let package_cache = PackageCache::new(
             default_cache_dir()
                 .expect("cache dir")
