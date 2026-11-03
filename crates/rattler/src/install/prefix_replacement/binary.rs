@@ -3,8 +3,11 @@
 //! terminator is filled with zeros.
 
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
+use std::sync::{LazyLock, Mutex};
+
+use aho_corasick::{AhoCorasick, AhoCorasickKind};
 
 use rattler_conda_types::package::{
     InvalidOffsetsError, OffsetEncoding, OffsetGroup, OffsetRanges,
@@ -91,18 +94,18 @@ fn find_cstring_patches<'a>(
     prefixes: &'a [EncodedPrefix],
 ) -> Vec<CStringPatch<'a>> {
     let mut candidates = Vec::new();
-    for prefix in prefixes {
-        let placeholder = prefix.placeholder.as_slice();
+    for (prefix, occurrences) in prefixes
+        .iter()
+        .zip(find_occurrences(source_bytes, prefixes))
+    {
+        let placeholder_len = prefix.placeholder.len();
         let unit = prefix.code_unit_size();
         // Per alignment class (offset modulo the code unit size), the end of the last candidate.
         let mut covered_until = vec![0; unit];
-        let mut search_from = 0;
-        while let Some(found) = memchr::memmem::find(&source_bytes[search_from..], placeholder) {
-            let first = search_from + found;
-            let after_first = first + placeholder.len();
-            // Resume right after this occurrence, not after its c-string: an occurrence of the
-            // same encoding at a different alignment can start before this terminator.
-            search_from = after_first;
+        // Every occurrence is visited, not just the first one after a c-string: an occurrence of
+        // the same encoding at a different alignment can start before this terminator.
+        for (i, &first) in occurrences.iter().enumerate() {
+            let after_first = first + placeholder_len;
             let alignment = first % unit;
             if first < covered_until[alignment] {
                 continue;
@@ -113,12 +116,11 @@ fn find_cstring_patches<'a>(
             // Collect the remaining occurrences in the same c-string: they share its terminator
             // and the padding that keeps the file length unchanged.
             let end = nul_pos.unwrap_or(source_bytes.len());
-            let mut offsets = vec![first];
-            let mut next = after_first;
-            while let Some(found) = memchr::memmem::find(&source_bytes[next..end], placeholder) {
-                offsets.push(next + found);
-                next += found + placeholder.len();
-            }
+            let offsets: Vec<usize> = occurrences[i..]
+                .iter()
+                .copied()
+                .take_while(|&offset| offset + placeholder_len <= end)
+                .collect();
             covered_until[alignment] = end;
 
             let rank = match (&prefix.encoding, alignment == 0, nul_pos.is_some()) {
@@ -160,6 +162,137 @@ fn find_cstring_patches<'a>(
     kept.into_values().collect()
 }
 
+/// Finds, for each of `prefixes`, the leftmost non-overlapping occurrences of its placeholder in
+/// `source_bytes`, in ascending order: exactly what repeated [`memchr::memmem::find`] calls that
+/// resume after each match return.
+///
+/// Binaries are large and rarely contain a placeholder, so this is where search-based replacement
+/// spends its time. Searching once per encoding reads the file five times. When every character of
+/// the placeholder is below U+0100, though, each of its wide code units is that character's byte
+/// padded with zeros, so both byte orders of an encoding share one needle: UTF-16-LE is
+/// `c0 00 c1 .. 00 cn 00` and UTF-16-BE is `00 c0 00 c1 .. 00 cn`, both around the core
+/// `c0 00 c1 .. 00 cn`, and likewise for UTF-32 with three zero bytes. A single multi-pattern
+/// search for the UTF-8 placeholder and the two cores finds every occurrence under every encoding;
+/// the zero bytes around a core then tell which byte order (or both) it is.
+fn find_occurrences(source_bytes: &[u8], prefixes: &[EncodedPrefix]) -> Vec<Vec<usize>> {
+    find_occurrences_single_pass(source_bytes, prefixes).unwrap_or_else(|| {
+        prefixes
+            .iter()
+            .map(|prefix| memchr::memmem::find_iter(source_bytes, &prefix.placeholder).collect())
+            .collect()
+    })
+}
+
+/// The single-pass search of [`find_occurrences`], or `None` when the placeholder does not allow it
+/// (a character at or above U+0100, or a single character, whose needles would coincide).
+fn find_occurrences_single_pass(
+    source_bytes: &[u8],
+    prefixes: &[EncodedPrefix],
+) -> Option<Vec<Vec<usize>>> {
+    let utf8 = prefixes
+        .iter()
+        .find(|prefix| prefix.encoding == OffsetEncoding::Utf8)?;
+    let searcher = core_searcher(&utf8.placeholder)?;
+
+    let zeros = |range: std::ops::Range<usize>| {
+        source_bytes
+            .get(range)
+            .is_some_and(|bytes| bytes.iter().all(|&byte| byte == 0))
+    };
+    // All occurrences, overlapping ones included, per encoding.
+    let mut all: [Vec<usize>; 5] = Default::default();
+    let index = |encoding: OffsetEncoding| match encoding {
+        OffsetEncoding::Utf8 => 0,
+        OffsetEncoding::Utf16Le => 1,
+        OffsetEncoding::Utf16Be => 2,
+        OffsetEncoding::Utf32Le => 3,
+        OffsetEncoding::Utf32Be => 4,
+    };
+    for found in searcher.find_overlapping_iter(source_bytes) {
+        let (start, end) = (found.start(), found.end());
+        match found.pattern().as_usize() {
+            0 => all[0].push(start),
+            pattern => {
+                let (pad, le, be) = if pattern == 1 { (1, 1, 2) } else { (3, 3, 4) };
+                if zeros(end..end + pad) {
+                    all[le].push(start);
+                }
+                if start >= pad && zeros(start - pad..start) {
+                    all[be].push(start - pad);
+                }
+            }
+        }
+    }
+
+    Some(
+        prefixes
+            .iter()
+            .map(|prefix| {
+                let mut occurrences = std::mem::take(&mut all[index(prefix.encoding)]);
+                occurrences.sort_unstable();
+                // Keep the leftmost non-overlapping ones, as a search resuming after each match.
+                let len = prefix.placeholder.len();
+                let mut next_allowed = 0;
+                occurrences.retain(|&offset| {
+                    let keep = offset >= next_allowed;
+                    if keep {
+                        next_allowed = offset + len;
+                    }
+                    keep
+                });
+                occurrences
+            })
+            .collect(),
+    )
+}
+
+/// The searcher for the UTF-8 placeholder and its UTF-16 and UTF-32 cores (pattern 0, 1 and 2), or
+/// `None` when the placeholder does not allow the single-pass search.
+///
+/// Building the automaton costs more than searching a typical binary with it, and a package uses
+/// one placeholder for all of its files, so searchers are cached per placeholder.
+fn core_searcher(placeholder: &[u8]) -> Option<AhoCorasick> {
+    /// More distinct placeholders than this in one process is unusual; the cache is simply reset.
+    const MAX_CACHED: usize = 16;
+    static CACHE: LazyLock<Mutex<HashMap<Vec<u8>, Option<AhoCorasick>>>> =
+        LazyLock::new(Mutex::default);
+
+    if let Some(cached) = CACHE.lock().unwrap().get(placeholder) {
+        return cached.clone();
+    }
+    let searcher = build_core_searcher(placeholder);
+    let mut cache = CACHE.lock().unwrap();
+    if cache.len() >= MAX_CACHED {
+        cache.clear();
+    }
+    cache.insert(placeholder.to_vec(), searcher.clone());
+    searcher
+}
+
+fn build_core_searcher(placeholder: &[u8]) -> Option<AhoCorasick> {
+    let text = std::str::from_utf8(placeholder).ok()?;
+    let chars: Vec<u8> = text
+        .chars()
+        .map(|c| u8::try_from(u32::from(c)).ok())
+        .collect::<Option<_>>()?;
+    if chars.len() < 2 {
+        return None;
+    }
+    let core = |unit: usize| -> Vec<u8> {
+        let mut core = Vec::with_capacity(chars.len() * unit);
+        for &c in &chars {
+            core.push(c);
+            core.extend(std::iter::repeat_n(0, unit - 1));
+        }
+        core.truncate(core.len() - (unit - 1));
+        core
+    };
+    AhoCorasick::builder()
+        .kind(Some(AhoCorasickKind::DFA))
+        .build([placeholder.to_vec(), core(2), core(4)])
+        .ok()
+}
+
 /// Finds the end of the c-string containing a placeholder occurrence: the offset of the first zero
 /// code unit at or after `from`, or `None` when the c-string is unterminated at end-of-file.
 ///
@@ -168,6 +301,9 @@ fn find_cstring_patches<'a>(
 /// it is not, which is exactly why a missing terminator has to be distinguishable from a found
 /// one.
 fn cstring_end(source_bytes: &[u8], from: usize, unit: usize) -> Option<usize> {
+    if unit == 1 {
+        return memchr::memchr(0, source_bytes.get(from..)?).map(|nul| from + nul);
+    }
     let mut pos = from;
     while pos + unit <= source_bytes.len() {
         if source_bytes[pos..pos + unit].iter().all(|&byte| byte == 0) {
@@ -343,4 +479,148 @@ fn validate_cstring_patches(
         prev_end = terminator;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod search_tests {
+    use proptest::prelude::*;
+
+    use super::*;
+
+    /// The search as it was before the single pass: one scan per encoding, resumed after every
+    /// match, and the remaining occurrences of a c-string collected by scanning it again.
+    fn reference_patches(
+        source_bytes: &[u8],
+        prefixes: &[EncodedPrefix],
+    ) -> Vec<(usize, usize, Vec<usize>, OffsetEncoding)> {
+        let mut candidates = Vec::new();
+        for prefix in prefixes {
+            let placeholder = prefix.placeholder.as_slice();
+            let unit = prefix.code_unit_size();
+            let mut covered_until = vec![0; unit];
+            let mut search_from = 0;
+            while let Some(found) = memchr::memmem::find(&source_bytes[search_from..], placeholder)
+            {
+                let first = search_from + found;
+                let after_first = first + placeholder.len();
+                search_from = after_first;
+                let alignment = first % unit;
+                if first < covered_until[alignment] {
+                    continue;
+                }
+                let mut pos = after_first;
+                let mut nul_pos = None;
+                while pos + unit <= source_bytes.len() {
+                    if source_bytes[pos..pos + unit].iter().all(|&byte| byte == 0) {
+                        nul_pos = Some(pos);
+                        break;
+                    }
+                    pos += unit;
+                }
+                let end = nul_pos.unwrap_or(source_bytes.len());
+                let mut offsets = vec![first];
+                let mut next = after_first;
+                while let Some(found) = memchr::memmem::find(&source_bytes[next..end], placeholder)
+                {
+                    offsets.push(next + found);
+                    next += found + placeholder.len();
+                }
+                covered_until[alignment] = end;
+                let rank = match (&prefix.encoding, alignment == 0, nul_pos.is_some()) {
+                    (OffsetEncoding::Utf8, _, _) => 0u8,
+                    (_, true, true) => 1,
+                    (_, true, false) => 2,
+                    (_, false, true) => 3,
+                    (_, false, false) => 4,
+                };
+                candidates.push((rank, offsets, end, prefix.encoding));
+            }
+        }
+        candidates.sort_by_key(|(rank, offsets, ..)| (*rank, offsets[0]));
+        let mut kept: BTreeMap<usize, (usize, Vec<usize>, OffsetEncoding)> = BTreeMap::new();
+        for (_, offsets, end, encoding) in candidates {
+            let start = offsets[0];
+            let overlaps_earlier = kept
+                .range(..=start)
+                .next_back()
+                .is_some_and(|(_, earlier)| start < earlier.0);
+            let overlaps_later = kept
+                .range(start..)
+                .next()
+                .is_some_and(|(&later_start, _)| later_start < end);
+            if !overlaps_earlier && !overlaps_later {
+                kept.insert(start, (end, offsets, encoding));
+            }
+        }
+        kept.into_iter()
+            .map(|(start, (end, offsets, encoding))| (start, end, offsets, encoding))
+            .collect()
+    }
+
+    fn patches(
+        source_bytes: &[u8],
+        prefixes: &[EncodedPrefix],
+    ) -> Vec<(usize, usize, Vec<usize>, OffsetEncoding)> {
+        find_cstring_patches(source_bytes, prefixes)
+            .into_iter()
+            .map(|patch| {
+                (
+                    patch.offsets[0],
+                    patch.nul_pos,
+                    patch.offsets.into_owned(),
+                    patch.prefix.encoding,
+                )
+            })
+            .collect()
+    }
+
+    /// Placeholders covering the single-pass search (including self-overlapping ones, whose
+    /// leftmost non-overlapping matches differ from all matches) and the fallback.
+    const PLACEHOLDERS: &[&str] = &[
+        "/pfx/pfx",
+        "abab",
+        "/aa",
+        "_ph_ph_ph",
+        "/opt/é",
+        "/opt/€",
+        "/",
+    ];
+
+    fn source() -> impl Strategy<Value = (usize, Vec<u8>)> {
+        let placeholder = 0..PLACEHOLDERS.len();
+        placeholder.prop_flat_map(|index| {
+            let text = PLACEHOLDERS[index];
+            let chunk = prop_oneof![
+                3 => (0usize..5).prop_map(move |encoding| OffsetEncoding::DEFINED[encoding].encode(text)),
+                // Fragments of the placeholder, so near-misses and overlaps occur.
+                2 => (0usize..5, 0usize..8).prop_map(move |(encoding, cut)| {
+                    let bytes = OffsetEncoding::DEFINED[encoding].encode(text);
+                    bytes[..cut.min(bytes.len())].to_vec()
+                }),
+                3 => proptest::collection::vec(prop_oneof![4 => Just(0u8), 1 => any::<u8>(), 2 => proptest::sample::select(text.as_bytes().to_vec())], 0..6),
+            ];
+            (Just(index), proptest::collection::vec(chunk, 0..24).prop_map(|chunks| chunks.concat()))
+        })
+    }
+
+    proptest! {
+        #[test]
+        fn single_pass_matches_per_encoding_search((index, source) in source()) {
+            let prefixes = EncodedPrefix::all(PLACEHOLDERS[index], "");
+            let per_encoding: Vec<Vec<usize>> = prefixes
+                .iter()
+                .map(|prefix| memchr::memmem::find_iter(&source, &prefix.placeholder).collect())
+                .collect();
+            prop_assert_eq!(find_occurrences(&source, &prefixes), per_encoding);
+            prop_assert_eq!(patches(&source, &prefixes), reference_patches(&source, &prefixes));
+        }
+    }
+
+    #[test]
+    fn single_pass_is_used_for_latin1_placeholders() {
+        let prefixes = EncodedPrefix::all("/opt/é", "");
+        assert!(find_occurrences_single_pass(b"", &prefixes).is_some());
+        let prefixes = EncodedPrefix::all("/opt/€", "");
+        assert!(find_occurrences_single_pass(b"", &prefixes).is_none());
+    }
 }
