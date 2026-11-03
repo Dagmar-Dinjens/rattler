@@ -1,0 +1,26 @@
+name: debug mount regression
+on:
+  push:
+    branches: [debug/mount-regr-*]
+permissions:
+  contents: read
+jobs:
+  phases:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: sudo apt-get update && sudo apt-get install -y fuse3
+      - uses: dtolnay/rust-toolchain@stable
+      - run: nproc; lscpu | grep -E 'Model name|Thread|Flags' | cut -c1-200
+      - run: cargo build --release -p rattler_vfs --examples
+      - name: mount phases
+        run: for i in 1 2; do cargo run -q --release -p rattler_vfs --example mount_phases; done
+      - name: scan cost
+        if: hashFiles('crates/rattler_vfs/examples/scan_cost.rs') != ''
+        run: cargo run -q --release -p rattler_vfs --example scan_cost -- ~/.cache/rattler/cache/pkgs
+      - name: criterion spinup/mounted + virtual_fs_new
+        run: |
+          cargo bench -p rattler_vfs --bench vfs_ops -- virtual_fs_new 2>&1 | grep -E 'time:|^vfs'
+          cargo bench -p rattler_vfs --bench spinup -- 'spinup/mounted$' 2>&1 | grep -E 'time:|^spinup'
