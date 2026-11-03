@@ -2118,3 +2118,14 @@ mod projfs_tests {
         remove_projfs_root(&tmp.path().join("missing")).unwrap();
     }
 }
+
+impl MetadataTree {
+    /// Number of nodes.
+    pub fn len(&self) -> usize { self.0.len() }
+    /// Whether empty.
+    pub fn is_empty(&self) -> bool { self.0.is_empty() }
+}
+impl VirtualFS {
+    /// Bench helper.
+    pub fn from_tree(tree: MetadataTree, mount_point: &std::path::Path) -> Self { Self::new(tree.0, mount_point) }
+}

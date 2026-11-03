@@ -5219,6 +5219,7 @@ dependencies = [
 name = "rattler"
 version = "0.55.4"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "assert_matches",
  "astral-reqwest-middleware",
@@ -5248,6 +5249,7 @@ dependencies = [
  "openidconnect",
  "parking_lot",
  "path_resolver",
+ "proptest",
  "rand 0.10.3",
  "rattler_cache",
  "rattler_conda_types",
@@ -6062,8 +6064,10 @@ dependencies = [
 name = "rattler_vfs"
 version = "0.1.4"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "astral-reqwest-middleware",
+ "criterion",
  "fuser",
  "hex",
  "libc",
