@@ -4177,6 +4177,7 @@ dependencies = [
 name = "rattler"
 version = "0.55.4"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "astral-reqwest-middleware",
  "base64",
